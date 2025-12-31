@@ -26,6 +26,7 @@ npm install
 
 # 3. Build Application
 echo "Hammering out the build..."
+export USE_SYSTEM_FPM="true"
 npm run build
 
 # 4. Setup Systemd Service (Auto-start)
