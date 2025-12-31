@@ -8,7 +8,16 @@ echo "🚀 Starting Fast Deployment for Elevator Monitor..."
 # 1. Update & Install Dependencies
 echo "📦 Installing system dependencies..."
 sudo apt-get update
-sudo apt-get install -y nodejs npm libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
+sudo apt-get install -y curl ca-certificates gnupg
+
+# 1b. Install Node.js 22.x (Required for Vite/Electron)
+echo "🟢 Upgrading Node.js to v22..."
+curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
+sudo -E bash nodesource_setup.sh
+sudo apt-get install -y nodejs build-essential
+
+# 1c. Install Runtime Libraries
+sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
 
 # 2. Install Project Dependencies
 echo "📥 Installing project packages..."
