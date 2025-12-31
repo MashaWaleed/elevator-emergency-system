@@ -3,6 +3,19 @@
   "version": "1.0.0",
   "description": "",
   "main": "dist-electron/main.js",
+  "build": {
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "maintainer": "admin@elevator-system.com",
+      "category": "Utility"
+    }
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build && electron-builder",

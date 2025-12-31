@@ -17,7 +17,7 @@ sudo -E bash nodesource_setup.sh
 sudo apt-get install -y nodejs build-essential
 
 # 1c. Install Runtime Libraries
-sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0
+sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libgbm1 libasound2 libpangocairo-1.0-0 libxss1 libgtk-3-0 libfuse2
 
 # 2. Install Project Dependencies
 echo "📥 Installing project packages..."
