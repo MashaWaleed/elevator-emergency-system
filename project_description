@@ -1,0 +1,285 @@
+Emergency Elevator Monitoring System - Raspberry Pi 5 Project
+Project Overview
+A real-time emergency monitoring and response system for multiple elevators across different buildings and floors, running on a Raspberry Pi 5. The system provides visual management of elevator locations, emergency alert handling, and acknowledgment capabilities through an intuitive drag-and-drop interface.
+System Purpose
+Monitor emergency button activations from networked elevators and provide immediate visual and audible alerts to operators, ensuring rapid response to emergency situations. The system requires explicit operator acknowledgment to dismiss alerts and communicates resolution status back to the elevator nodes.
+Hardware Requirements
+
+Raspberry Pi 5 (4GB or 8GB RAM recommended)
+Monitor (HDMI connection)
+USB Keyboard and Mouse
+Network Connection (Ethernet recommended for reliability, WiFi supported)
+Speakers or Audio Output (for emergency alert sounds)
+Power Supply (27W USB-C PD adapter recommended)
+MicroSD Card (32GB minimum, Class 10 or better)
+
+Software Architecture
+Operating System
+
+Raspberry Pi OS (64-bit, Desktop version)
+Python 3.11+ runtime environment
+
+Technology Stack
+Backend:
+
+Python - Core application logic
+Flask/FastAPI - Web server and REST API
+Socket Programming - UDP/TCP listener for elevator emergency packets
+SQLite - Local database for configuration and event logging
+Threading/AsyncIO - Concurrent packet monitoring and web server operation
+
+Frontend:
+
+HTML5/CSS3/JavaScript - User interface
+React or Vue.js - Interactive component framework
+Drag-and-Drop Library - GridStack.js or React-DnD for dashboard building
+WebSocket/Server-Sent Events - Real-time emergency alerts from backend to UI
+Audio API - Emergency alarm playback
+
+Network Communication Protocol
+
+Listening Port: UDP/TCP port (e.g., 5000) for incoming emergency packets
+Packet Format: JSON structure containing:
+
+Elevator ID/MAC address
+Building identifier
+Floor number
+Timestamp
+Emergency status (pressed/acknowledged)
+Optional: additional sensor data
+
+
+
+Core Features
+1. Dashboard Builder (Configuration Mode)
+
+Drag-and-drop interface for positioning elevator icons on a visual canvas
+Elevator properties panel for configuring:
+
+Unique elevator ID (matches network node)
+Building name
+Floor number
+Physical location description
+IP address or MAC address of elevator node
+
+
+Grid/canvas system representing physical site layout
+Save/load configuration to persistent storage
+Visual grouping by building or zone
+
+2. Real-Time Monitoring Mode
+
+Live status display of all configured elevators
+Color-coded indicators:
+
+Green: Normal operation
+Red: Emergency active
+Gray: Offline/no communication
+
+
+Last contact timestamp for each elevator
+Automatic layout based on saved dashboard configuration
+
+3. Emergency Alert System
+
+Immediate visual alert:
+
+Full-screen or prominent modal popup
+Flashing red border/background
+Large text showing building, floor, and elevator ID
+Timestamp of emergency activation
+
+
+Audible alarm:
+
+Continuous or pulsing emergency sound
+Adjustable volume
+Continues until acknowledged
+
+
+Alert queue for multiple simultaneous emergencies
+Alert history log with timestamps
+
+4. Acknowledgment Mechanism
+
+Deliberate user action required:
+
+Large "ACKNOWLEDGE EMERGENCY" button
+Optional: require typing elevator ID for confirmation
+Optional: add operator notes/comments
+
+
+Network response:
+
+Send acknowledgment packet back to originating elevator node
+Include timestamp and operator ID (if applicable)
+
+
+Status update:
+
+Stop alarm sound
+Update elevator status on dashboard
+Log acknowledgment event
+
+
+
+5. Data Logging and History
+
+SQLite database storing:
+
+Emergency event records (timestamp, elevator, duration, acknowledger)
+System health logs (elevator connectivity, packet statistics)
+Configuration changes
+Operator actions
+
+
+Export functionality for reports (CSV/PDF)
+Search and filter historical events
+
+6. System Health Monitoring
+
+Watchdog timers for each elevator (detect offline nodes)
+Network statistics (packets received, latency)
+System resource monitoring (CPU, memory, network usage)
+Auto-reconnection logic for dropped connections
+
+File Structure
+/home/pi/elevator-monitor/
+├── backend/
+│   ├── main.py                 # Application entry point
+│   ├── network_listener.py     # UDP/TCP packet receiver
+│   ├── api_server.py           # Flask/FastAPI REST endpoints
+│   ├── database.py             # SQLite database operations
+│   ├── alert_manager.py        # Emergency alert logic
+│   ├── config.py               # Configuration management
+│   └── models.py               # Data models
+├── frontend/
+│   ├── index.html              # Main UI
+│   ├── css/
+│   │   └── styles.css
+│   ├── js/
+│   │   ├── dashboard.js        # Drag-and-drop dashboard
+│   │   ├── monitoring.js       # Real-time status updates
+│   │   ├── alerts.js           # Emergency alert handling
+│   │   └── websocket.js        # Real-time communication
+│   └── assets/
+│       ├── sounds/
+│       │   └── emergency.mp3
+│       └── icons/
+│           └── elevator.svg
+├── data/
+│   ├── elevators.db            # SQLite database
+│   └── dashboard_config.json   # Saved dashboard layout
+├── logs/
+│   └── system.log
+└── requirements.txt            # Python dependencies
+Network Packet Specification
+Emergency Activation Packet (Elevator → RPi5)
+json{
+  "type": "emergency",
+  "elevator_id": "ELEV-B2-F05",
+  "building": "Building 2",
+  "floor": 5,
+  "timestamp": "2025-12-29T14:32:15Z",
+  "status": "active",
+  "ip_address": "192.168.1.105"
+}
+Acknowledgment Packet (RPi5 → Elevator)
+json{
+  "type": "acknowledgment",
+  "elevator_id": "ELEV-B2-F05",
+  "timestamp": "2025-12-29T14:33:02Z",
+  "operator": "Station-1",
+  "status": "acknowledged"
+}
+Installation Steps
+
+Prepare Raspberry Pi 5
+
+Flash Raspberry Pi OS to microSD card
+Boot and complete initial setup
+Connect to LAN network
+Enable SSH if remote access needed
+
+
+Install System Dependencies
+
+bash   sudo apt update
+   sudo apt install python3-pip python3-venv git sqlite3 alsa-utils
+
+Create Project Directory
+
+bash   mkdir ~/elevator-monitor
+   cd ~/elevator-monitor
+   python3 -m venv venv
+   source venv/bin/activate
+
+Install Python Packages
+
+bash   pip install flask flask-cors websockets sqlite3 pyaudio
+
+Configure Network
+
+Set static IP address for reliability
+Configure firewall to allow incoming packets on monitoring port
+Test connectivity with elevator nodes
+
+
+Deploy Application
+
+Copy application files to project directory
+Configure database schema
+Set appropriate file permissions
+Test audio output
+
+
+Auto-Start Configuration
+
+Create systemd service for backend
+Configure Chromium kiosk mode for frontend (auto-launch on boot)
+Set up logging rotation
+
+
+
+Security Considerations
+
+Network security: Consider packet authentication/encryption if on untrusted networks
+Access control: Optional password protection for configuration changes
+Audit logging: Track all operator actions and system events
+Backup: Regular automated backups of database and configuration
+
+Testing Requirements
+
+Unit tests for packet parsing and alert logic
+Integration tests for end-to-end emergency flow
+Stress testing for multiple simultaneous emergencies
+Network failure simulation to test reconnection logic
+User acceptance testing with actual operators
+
+Performance Requirements
+
+Packet reception latency: < 100ms from network receipt to alert trigger
+UI responsiveness: Dashboard updates within 200ms
+Alert activation time: < 500ms from packet receipt to audible alarm
+System uptime: 99.9% availability target
+Concurrent emergencies: Support minimum 50 simultaneous active alerts
+
+Future Enhancement Possibilities
+
+Multi-monitor support for larger facilities
+Mobile app for remote monitoring
+Integration with building management systems
+Video feed integration for visual verification
+Predictive maintenance alerts
+Analytics dashboard for emergency patterns
+Voice announcement system
+Integration with emergency services notification
+
+Documentation Deliverables
+
+User manual for operators
+Administrator guide for configuration
+Network integration guide for elevator node developers
+API documentation
+Troubleshooting guide
+
