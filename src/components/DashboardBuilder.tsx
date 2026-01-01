@@ -1,7 +1,6 @@
-import { useState } from 'react'
-import { Elevator } from '../types'
-import { motion, AnimatePresence } from 'framer-motion'
-import { Plus, Trash2, Save, Move, HardDrive, Layout, Terminal, CheckCircle, Building2, Layers, Hash, Wifi, Globe } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
+import { Elevator, ElevatorUnit, PendingDevice } from '../types'
+import { Plus, Trash2, Move, HardDrive, Layout, Terminal, CheckCircle, Building2, Layers, Hash, Globe, DoorOpen, Edit2, X } from 'lucide-react'
 
 interface Props {
     elevators: Elevator[];
@@ -9,76 +8,390 @@ interface Props {
 }
 
 export default function DashboardBuilder({ elevators, onElevatorsChange }: Props) {
-    const [newEl, setNewEl] = useState({ id: '', building: '', floor: 0, ip_address: '' })
-    const [isSaving, setIsSaving] = useState(false)
-    const [showSaveSuccess, setShowSaveSuccess] = useState(false)
+    const [newElevator, setNewElevator] = useState({ label: '', nodeId: '' })
+    const [manualNode, setManualNode] = useState({ id: '', ip: '', building: '', floor: 0, unitIdsText: '' })
+    const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+    const [showNodeSuccess, setShowNodeSuccess] = useState(false)
+    const [showElevatorSuccess, setShowElevatorSuccess] = useState(false)
     const [error, setError] = useState<string | null>(null)
 
-    const addElevator = async () => {
-        if (!newEl.id.trim()) {
-            setError('Node ID is required')
-            return
-        }
-        if (!newEl.ip_address.trim()) {
-            setError('IP Address is required')
-            return
-        }
+    // Edit states
+    const [editingNode, setEditingNode] = useState<{ id: string; newId: string; building: string; floor: number } | null>(null)
+    const [editingUnit, setEditingUnit] = useState<{ nodeId: string; id: string; newId: string; label: string } | null>(null)
 
-        // Validate IP address format
-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
-        if (!ipRegex.test(newEl.ip_address.trim())) {
-            setError('Invalid IP address format (e.g., 192.168.1.100)')
+    const [pendingDevices, setPendingDevices] = useState<PendingDevice[]>([])
+    const [pendingEdits, setPendingEdits] = useState<
+        Record<string, { nodeId: string; building: string; floor: number; unitCount: number; unitIdsText: string }>
+    >({})
+    
+    const [zoom, setZoom] = useState(1)
+    const [pan, setPan] = useState({ x: 0, y: 0 })
+    const canvasRef = useRef<HTMLDivElement>(null)
+    const [isDragging, setIsDragging] = useState(false)
+    const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
+
+    const loadPendingDevices = async () => {
+        try {
+            const res = await window.electron.invoke('get-pending-devices')
+            setPendingDevices(res)
+            setPendingEdits(prev => {
+                const next = { ...prev }
+                for (const d of res as PendingDevice[]) {
+                    if (!next[d.device_ip]) {
+                        const suggested = d.mac_address
+                            ? `NODE-${d.mac_address.replace(/:/g, '').toUpperCase()}`
+                            : `NODE-${d.device_ip.replace(/\./g, '_')}`
+                        next[d.device_ip] = {
+                            nodeId: suggested,
+                            building: '',
+                            floor: 0,
+                            unitCount: Math.max(0, d.buttons || 0),
+                            unitIdsText: '',
+                        }
+                    }
+                }
+                return next
+            })
+        } catch (err) {
+            console.error('Failed to load pending devices:', err)
+        }
+    }
+
+    // Auto-fit all nodes on mount or when elevators change
+    useEffect(() => {
+        if (elevators.length > 0 && canvasRef.current) {
+            autoFitNodes()
+        }
+    }, [elevators.length])
+
+    useEffect(() => {
+        loadPendingDevices()
+        const unsub = window.electron.on('pending-device', (data: PendingDevice) => {
+            setPendingDevices(prev => {
+                const exists = prev.some(p => p.device_ip === data.device_ip)
+                if (exists) {
+                    return prev.map(p => (p.device_ip === data.device_ip ? { ...p, ...data } : p))
+                }
+                return [data, ...prev]
+            })
+            setPendingEdits(prev => {
+                if (prev[data.device_ip]) return prev
+                const suggested = data.mac_address
+                    ? `NODE-${String(data.mac_address).replace(/:/g, '').toUpperCase()}`
+                    : `NODE-${data.device_ip.replace(/\./g, '_')}`
+                return {
+                    ...prev,
+                    [data.device_ip]: {
+                        nodeId: suggested,
+                        building: '',
+                        floor: 0,
+                        unitCount: Math.max(0, data.buttons || 0),
+                        unitIdsText: '',
+                    },
+                }
+            })
+        })
+        return () => {
+            unsub()
+        }
+    }, [])
+
+    const autoFitNodes = () => {
+        if (elevators.length === 0 || !canvasRef.current) return
+        
+        const bounds = {
+            minX: Math.min(...elevators.map(e => e.x)),
+            maxX: Math.max(...elevators.map(e => e.x + 160)),
+            minY: Math.min(...elevators.map(e => e.y)),
+            maxY: Math.max(...elevators.map(e => e.y + 140))
+        }
+        
+        const width = bounds.maxX - bounds.minX
+        const height = bounds.maxY - bounds.minY
+        const containerWidth = canvasRef.current.clientWidth
+        const containerHeight = canvasRef.current.clientHeight
+        
+        const zoomX = containerWidth / (width + 20)
+        const zoomY = containerHeight / (height + 20)
+        const newZoom = Math.min(zoomX, zoomY, 1.5)
+        
+        setZoom(newZoom)
+        setPan({
+            x: (containerWidth - width * newZoom) / 2 - bounds.minX * newZoom,
+            y: (containerHeight - height * newZoom) / 2 - bounds.minY * newZoom
+        })
+    }
+
+    const handleWheel = (e: React.WheelEvent) => {
+        e.preventDefault()
+        const delta = e.deltaY > 0 ? 0.9 : 1.1
+        setZoom(prev => Math.max(0.1, Math.min(3, prev * delta)))
+    }
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        if ((e.target as HTMLElement).closest('.draggable-item')) return
+        setIsDragging(true)
+        setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y })
+    }
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+        if (isDragging) {
+            setPan({
+                x: e.clientX - dragStart.x,
+                y: e.clientY - dragStart.y
+            })
+        }
+    }
+
+    const handleMouseUp = () => {
+        setIsDragging(false)
+    }
+
+    const approvePendingDevice = async (deviceIp: string) => {
+        const edit = pendingEdits[deviceIp] || { nodeId: '', building: '', floor: 0, unitCount: 0, unitIdsText: '' }
+        try {
+            setError(null)
+            if (!edit.nodeId.trim()) {
+                setError('Node ID is required')
+                return
+            }
+
+            const unitIds = edit.unitIdsText
+                .split(/\r?\n/)
+                .map(s => s.trim())
+                .filter(Boolean)
+
+            await window.electron.invoke('approve-pending-device', {
+                deviceIp,
+                nodeId: edit.nodeId.trim(),
+                building: edit.building,
+                floor: edit.floor,
+                unitCount: edit.unitCount,
+                unitIds: unitIds.length > 0 ? unitIds : undefined,
+            })
+            const dbElevators = await window.electron.invoke('get-elevators')
+            onElevatorsChange(dbElevators)
+            await loadPendingDevices()
+            setShowNodeSuccess(true)
+            setTimeout(() => setShowNodeSuccess(false), 2000)
+        } catch (err) {
+            console.error('Failed to approve device:', err)
+            setError('Failed to approve device')
+        }
+    }
+
+    const registerNodeManually = async () => {
+        try {
+            setError(null)
+            const nodeId = manualNode.id.trim()
+            if (!nodeId) {
+                setError('Node ID is required')
+                return
+            }
+            const ip = manualNode.ip.trim()
+            if (!ip) {
+                setError('IP address is required')
+                return
+            }
+
+            const unitIds = manualNode.unitIdsText
+                .split(/\r?\n/)
+                .map(s => s.trim())
+                .filter(Boolean)
+
+            await window.electron.invoke('add-elevator', {
+                id: nodeId,
+                building: manualNode.building || 'Unassigned',
+                floor: manualNode.floor || 0,
+                ip_address: ip,
+                status: 'offline',
+                lastSeen: 0,
+                x: 60,
+                y: 60,
+            })
+
+            for (let i = 0; i < unitIds.length; i++) {
+                const uid = unitIds[i]
+                const unit: ElevatorUnit = {
+                    id: uid,
+                    label: uid,
+                    unitIndex: i + 1,
+                    x: 60 + 180 + i * 140,
+                    y: 60,
+                    status: 'offline',
+                    nodeId,
+                }
+                await window.electron.invoke('add-elevator-unit', unit)
+            }
+
+            const dbElevators = await window.electron.invoke('get-elevators')
+            onElevatorsChange(dbElevators)
+            setManualNode({ id: '', ip: '', building: '', floor: 0, unitIdsText: '' })
+            setShowNodeSuccess(true)
+            setTimeout(() => setShowNodeSuccess(false), 2000)
+        } catch (err) {
+            console.error('Failed to manually register node:', err)
+            setError('Failed to manually register node')
+        }
+    }
+
+    const rejectPendingDevice = async (deviceIp: string) => {
+        try {
+            setError(null)
+            await window.electron.invoke('reject-pending-device', deviceIp)
+            await loadPendingDevices()
+        } catch (err) {
+            console.error('Failed to reject device:', err)
+            setError('Failed to reject device')
+        }
+    }
+
+    const addElevatorToNode = async () => {
+        if (!newElevator.label.trim()) {
+            setError('Elevator label is required')
             return
         }
-
-        // Check for duplicate ID
-        if (elevators.some(e => e.id === newEl.id.trim())) {
-            setError('A node with this ID already exists')
+        if (!newElevator.nodeId) {
+            setError('Please select a node')
             return
         }
 
         setError(null)
 
-        const elevator: Elevator = {
-            id: newEl.id.trim(),
-            building: newEl.building.trim() || 'Unassigned',
-            floor: newEl.floor,
-            ip_address: newEl.ip_address.trim(),
+        const node = elevators.find(e => e.id === newElevator.nodeId)
+        if (!node) return
+
+        // Use the label as the ID (user-provided name)
+        const elevatorId = newElevator.label.trim()
+
+        const elevatorUnit: ElevatorUnit = {
+            id: elevatorId,
+            label: elevatorId,
+            unitIndex: ((node.elevators?.length || 0) + 1),
+            x: node.x + 180 + (node.elevators?.length || 0) * 150,
+            y: node.y,
             status: 'offline',
-            lastSeen: 0,
-            x: 60 + (elevators.length % 4) * 160,
-            y: 60 + Math.floor(elevators.length / 4) * 140
+            nodeId: newElevator.nodeId
         }
 
         try {
             // Save to database
-            await window.electron.invoke('add-elevator', elevator)
+            await window.electron.invoke('add-elevator-unit', elevatorUnit)
 
-            // Update local state
-            onElevatorsChange([...elevators, elevator])
+            const updatedElevators = elevators.map(el => {
+                if (el.id === newElevator.nodeId) {
+                    return {
+                        ...el,
+                        elevators: [...(el.elevators || []), elevatorUnit]
+                    }
+                }
+                return el
+            })
 
-            // Reset form
-            setNewEl({ id: '', building: '', floor: 0, ip_address: '' })
-
-            // Show success
-            setShowSaveSuccess(true)
-            setTimeout(() => setShowSaveSuccess(false), 2000)
+            onElevatorsChange(updatedElevators)
+            setNewElevator({ label: '', nodeId: '' })
+            setShowElevatorSuccess(true)
+            setTimeout(() => setShowElevatorSuccess(false), 2000)
         } catch (err) {
-            console.error('Failed to add elevator:', err)
-            setError('Failed to save elevator to database')
+            console.error('Failed to add elevator unit:', err)
+            setError('Failed to save elevator unit to database')
         }
     }
 
-    const removeElevator = async (id: string) => {
+    const removeNode = async (id: string) => {
         try {
             await window.electron.invoke('remove-elevator', id)
             onElevatorsChange(elevators.filter(e => e.id !== id))
         } catch (err) {
-            console.error('Failed to remove elevator:', err)
+            console.error('Failed to remove node:', err)
         }
     }
 
-    const updatePosition = async (id: string, x: number, y: number) => {
+    const removeElevatorUnit = async (nodeId: string, elevatorId: string) => {
+        try {
+            await window.electron.invoke('remove-elevator-unit', elevatorId)
+            
+            const updatedElevators = elevators.map(node => {
+                if (node.id === nodeId) {
+                    return {
+                        ...node,
+                        elevators: (node.elevators || []).filter(e => e.id !== elevatorId)
+                    }
+                }
+                return node
+            })
+            onElevatorsChange(updatedElevators)
+        } catch (err) {
+            console.error('Failed to remove elevator unit:', err)
+        }
+    }
+
+    const startEditNode = (node: Elevator) => {
+        setEditingNode({
+            id: node.id,
+            newId: node.id,
+            building: node.building,
+            floor: node.floor
+        })
+    }
+
+    const saveEditNode = async () => {
+        if (!editingNode) return
+        try {
+            setError(null)
+            const result = await window.electron.invoke('update-node', {
+                oldId: editingNode.id,
+                newId: editingNode.newId.trim(),
+                building: editingNode.building,
+                floor: editingNode.floor
+            })
+            if (!result.success) {
+                setError(result.error || 'Failed to update node')
+                return
+            }
+            // Refresh elevators from DB
+            const dbElevators = await window.electron.invoke('get-elevators')
+            onElevatorsChange(dbElevators)
+            setEditingNode(null)
+        } catch (err) {
+            console.error('Failed to update node:', err)
+            setError('Failed to update node')
+        }
+    }
+
+    const startEditUnit = (nodeId: string, unit: ElevatorUnit) => {
+        setEditingUnit({
+            nodeId,
+            id: unit.id,
+            newId: unit.id,
+            label: unit.label
+        })
+    }
+
+    const saveEditUnit = async () => {
+        if (!editingUnit) return
+        try {
+            setError(null)
+            const result = await window.electron.invoke('update-elevator-unit', {
+                oldId: editingUnit.id,
+                newId: editingUnit.newId.trim(),
+                label: editingUnit.label.trim()
+            })
+            if (!result.success) {
+                setError(result.error || 'Failed to update elevator')
+                return
+            }
+            // Refresh elevators from DB
+            const dbElevators = await window.electron.invoke('get-elevators')
+            onElevatorsChange(dbElevators)
+            setEditingUnit(null)
+        } catch (err) {
+            console.error('Failed to update elevator unit:', err)
+            setError('Failed to update elevator')
+        }
+    }
+
+    const updateNodePosition = async (id: string, x: number, y: number) => {
         try {
             await window.electron.invoke('update-elevator-position', id, x, y)
         } catch (err) {
@@ -86,9 +399,52 @@ export default function DashboardBuilder({ elevators, onElevatorsChange }: Props
         }
     }
 
+    const updateElevatorPosition = async (nodeId: string, elevatorId: string, x: number, y: number) => {
+        try {
+            await window.electron.invoke('update-elevator-unit-position', elevatorId, x, y)
+            
+            const updatedElevators = elevators.map(node => {
+                if (node.id === nodeId) {
+                    return {
+                        ...node,
+                        elevators: (node.elevators || []).map(e => 
+                            e.id === elevatorId ? { ...e, x, y } : e
+                        )
+                    }
+                }
+                return node
+            })
+            onElevatorsChange(updatedElevators)
+        } catch (err) {
+            console.error('Failed to update elevator position:', err)
+        }
+    }
+
+    const handleItemDragEnd = (id: string, type: 'node' | 'elevator', nodeId: string | null, offsetX: number, offsetY: number) => {
+        if (type === 'node') {
+            const node = elevators.find(e => e.id === id)
+            if (node) {
+                const newX = node.x + offsetX / zoom
+                const newY = node.y + offsetY / zoom
+                const updatedElevators = elevators.map(el => 
+                    el.id === id ? { ...el, x: newX, y: newY } : el
+                )
+                onElevatorsChange(updatedElevators)
+                updateNodePosition(id, newX, newY)
+            }
+        } else if (type === 'elevator' && nodeId) {
+            const node = elevators.find(e => e.id === nodeId)
+            const elevator = node?.elevators?.find(e => e.id === id)
+            if (elevator) {
+                const newX = elevator.x + offsetX / zoom
+                const newY = elevator.y + offsetY / zoom
+                updateElevatorPosition(nodeId, id, newX, newY)
+            }
+        }
+    }
+
     return (
         <div className="flex flex-col gap-6 h-full">
-            {/* Header */}
             <header className="flex justify-between items-start">
                 <div>
                     <div className="flex items-center gap-3 mb-3">
@@ -96,179 +452,392 @@ export default function DashboardBuilder({ elevators, onElevatorsChange }: Props
                             <Layers size={10} className="mr-1" />
                             Configuration Mode
                         </span>
-                        <span className="text-xs font-mono text-tertiary">
-                            Database synced
-                        </span>
                     </div>
                     <h1 className="mb-2">System Constructor</h1>
-                    <p className="text-secondary text-sm">Register elevator nodes with their network addresses</p>
+                    <p className="text-secondary text-sm">Register nodes and configure elevators</p>
                 </div>
             </header>
 
-            {/* Main Grid */}
             <div className="grid grid-cols-12 gap-6 flex-1 min-h-0">
-                {/* Left Control Panel */}
-                <div className="col-span-4 flex flex-col gap-5 h-full overflow-hidden">
-                    {/* Add New Node Form */}
-                    <div className="glass p-6 relative overflow-hidden">
-                        {/* Gradient Accent */}
+                {/* Left Control Panel - Scrollable */}
+                <div className="col-span-4 overflow-y-auto pr-1" style={{minHeight: 0}}>
+                    <div className="flex flex-col gap-3">
+                    {/* Pending Devices */}
+                    <div className="glass p-3 relative">
                         <div className="absolute top-0 left-0 w-1 h-full bg-gradient-to-b from-blue-500 to-violet-500" />
-
-                        <h3 className="font-semibold flex items-center gap-3 mb-6">
-                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500/20 to-violet-500/20 flex items-center justify-center">
-                                <Plus size={16} className="text-blue-400" />
+                        <h3 className="font-semibold text-xs flex items-center gap-2 mb-2">
+                            <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-blue-500/20 to-violet-500/20 flex items-center justify-center">
+                                <Terminal size={12} className="text-blue-400" />
                             </div>
-                            Register New Node
+                            Pending Devices
                         </h3>
 
                         {error && (
-                            <div className="mb-4 p-3 rounded-lg bg-danger/10 border border-danger/30 text-danger text-sm">
+                            <div className="mb-2 p-2 rounded-lg bg-danger/10 border border-danger/30 text-danger text-xs">
                                 {error}
                             </div>
                         )}
 
-                        <div className="flex flex-col gap-4">
-                            <FormField
-                                label="Node Identifier"
-                                icon={<Hash size={14} />}
-                                placeholder="e.g. ELEV-NORTH-01"
-                                value={newEl.id}
-                                onChange={e => setNewEl({ ...newEl, id: e.target.value })}
-                            />
-                            <FormField
-                                label="IP Address"
-                                icon={<Globe size={14} />}
-                                placeholder="192.168.1.100"
-                                value={newEl.ip_address}
-                                onChange={e => setNewEl({ ...newEl, ip_address: e.target.value })}
-                            />
-                            <FormField
-                                label="Building / Zone"
-                                icon={<Building2 size={14} />}
-                                placeholder="North Wing A"
-                                value={newEl.building}
-                                onChange={e => setNewEl({ ...newEl, building: e.target.value })}
-                            />
-                            <FormField
-                                label="Floor Level"
-                                icon={<Layers size={14} />}
-                                placeholder="0"
-                                type="number"
-                                value={newEl.floor.toString()}
-                                onChange={e => setNewEl({ ...newEl, floor: parseInt(e.target.value) || 0 })}
-                            />
-
-                            <motion.button
-                                className="btn btn-primary w-full justify-center mt-2"
-                                onClick={addElevator}
-                                whileHover={{ scale: 1.01 }}
-                                whileTap={{ scale: 0.99 }}
-                            >
-                                <AnimatePresence mode="wait">
-                                    {showSaveSuccess ? (
-                                        <motion.div
-                                            key="success"
-                                            initial={{ opacity: 0, scale: 0.8 }}
-                                            animate={{ opacity: 1, scale: 1 }}
-                                            exit={{ opacity: 0, scale: 0.8 }}
-                                            className="flex items-center gap-2"
-                                        >
-                                            <CheckCircle size={18} />
-                                            Added!
-                                        </motion.div>
-                                    ) : (
-                                        <motion.div
-                                            key="add"
-                                            initial={{ opacity: 0, scale: 0.8 }}
-                                            animate={{ opacity: 1, scale: 1 }}
-                                            exit={{ opacity: 0, scale: 0.8 }}
-                                            className="flex items-center gap-2"
-                                        >
-                                            <Plus size={18} />
-                                            Add to Network
-                                        </motion.div>
-                                    )}
-                                </AnimatePresence>
-                            </motion.button>
-                        </div>
-                    </div>
-
-                    {/* Node Registry List */}
-                    <div className="glass flex-1 p-5 overflow-hidden flex flex-col">
-                        <div className="flex items-center justify-between mb-5">
-                            <h3 className="font-semibold flex items-center gap-3">
-                                <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center">
-                                    <Terminal size={14} className="text-tertiary" />
-                                </div>
-                                Node Registry
-                            </h3>
-                            <span className="badge font-mono">
-                                {elevators.length} {elevators.length === 1 ? 'node' : 'nodes'}
-                            </span>
-                        </div>
-
-                        <div className="flex-1 overflow-auto flex flex-col gap-2 pr-1">
-                            <AnimatePresence>
-                                {elevators.map((el, index) => (
-                                    <motion.div
-                                        key={el.id}
-                                        initial={{ opacity: 0, x: -20 }}
-                                        animate={{ opacity: 1, x: 0 }}
-                                        exit={{ opacity: 0, x: 20, height: 0 }}
-                                        transition={{ delay: index * 0.03 }}
-                                        className="group"
-                                    >
-                                        <div className="flex items-center justify-between p-4 rounded-xl bg-white/[0.03] border border-transparent hover:border-white/10 hover:bg-white/[0.05] transition-all">
-                                            <div className="flex items-center gap-4">
-                                                <div className="w-10 h-10 rounded-lg bg-black/30 flex items-center justify-center border border-white/5 relative">
-                                                    <HardDrive size={16} className="text-muted group-hover:text-blue-400 transition-colors" />
-                                                    <div
-                                                        className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border-2"
-                                                        style={{
-                                                            background: el.status === 'emergency' ? 'var(--danger)' :
-                                                                el.lastSeen > 0 ? 'var(--success)' : 'var(--text-muted)',
-                                                            borderColor: 'var(--bg-tertiary)'
-                                                        }}
-                                                    />
+                        {pendingDevices.length === 0 ? (
+                            <div className="text-xs text-muted">No new devices detected. Power on an ESP32 node to request registration.</div>
+                        ) : (
+                            <div className="flex flex-col gap-2">
+                                {pendingDevices.map((d) => {
+                                    const edit = pendingEdits[d.device_ip] || { nodeId: '', building: '', floor: 0, unitCount: 0, unitIdsText: '' }
+                                    return (
+                                        <div key={d.device_ip} className="p-2 rounded-lg border border-white/10 bg-white/5">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="min-w-0">
+                                                    <div className="text-xs font-mono text-secondary truncate">{d.device_ip}</div>
+                                                    <div className="text-[10px] text-muted truncate">{d.mac_address || 'MAC: unknown'} • buttons: {d.buttons || 0}</div>
                                                 </div>
-                                                <div>
-                                                    <p className="font-semibold text-sm tracking-tight">{el.id}</p>
-                                                    <p className="text-xs text-muted font-mono">
-                                                        {el.ip_address}
-                                                    </p>
-                                                    <p className="text-xs text-muted uppercase tracking-wide">
-                                                        {el.building} • FL {el.floor}
-                                                    </p>
+                                                <div className="flex gap-2 flex-shrink-0">
+                                                    <button className="btn btn-ghost text-xs py-1 px-2" onClick={() => rejectPendingDevice(d.device_ip)}>
+                                                        Reject
+                                                    </button>
+                                                    <button className="btn btn-primary text-xs py-1 px-2" onClick={() => approvePendingDevice(d.device_ip)}>
+                                                        {showNodeSuccess ? 'Approved!' : 'Approve'}
+                                                    </button>
                                                 </div>
                                             </div>
-                                            <motion.button
-                                                onClick={() => removeElevator(el.id)}
-                                                className="p-2 rounded-lg text-muted hover:text-danger hover:bg-danger/10 transition-all opacity-0 group-hover:opacity-100"
-                                                whileHover={{ scale: 1.1 }}
-                                                whileTap={{ scale: 0.9 }}
-                                            >
-                                                <Trash2 size={14} />
-                                            </motion.button>
-                                        </div>
-                                    </motion.div>
-                                ))}
-                            </AnimatePresence>
 
-                            {elevators.length === 0 && (
-                                <div className="flex-1 flex items-center justify-center">
-                                    <p className="text-sm text-muted italic text-center">
-                                        No nodes registered.<br />
-                                        Add nodes using the form above.
-                                    </p>
-                                </div>
+                                            <div className="flex flex-col gap-3 mt-3">
+                                                <FormField
+                                                    label="Node ID"
+                                                    icon={<Hash size={14} />}
+                                                    placeholder="NODE-01"
+                                                    value={edit.nodeId}
+                                                    onChange={e => setPendingEdits(prev => ({
+                                                        ...prev,
+                                                        [d.device_ip]: { ...edit, nodeId: e.target.value }
+                                                    }))}
+                                                />
+                                                <div className="grid grid-cols-2 gap-3">
+                                                    <FormField
+                                                        label="Building / Zone"
+                                                        icon={<Building2 size={14} />}
+                                                        placeholder="North Wing"
+                                                        value={edit.building}
+                                                        onChange={e => setPendingEdits(prev => ({
+                                                            ...prev,
+                                                            [d.device_ip]: { ...edit, building: e.target.value }
+                                                        }))}
+                                                    />
+                                                    <FormField
+                                                        label="Floor"
+                                                        icon={<Layers size={14} />}
+                                                        placeholder="0"
+                                                        type="number"
+                                                        value={String(edit.floor)}
+                                                        onChange={e => setPendingEdits(prev => ({
+                                                            ...prev,
+                                                            [d.device_ip]: { ...edit, floor: parseInt(e.target.value) || 0 }
+                                                        }))}
+                                                    />
+                                                </div>
+                                                <FormField
+                                                    label="Number of Elevators"
+                                                    icon={<DoorOpen size={14} />}
+                                                    placeholder="0"
+                                                    type="number"
+                                                    value={String(edit.unitCount)}
+                                                    onChange={e => setPendingEdits(prev => ({
+                                                        ...prev,
+                                                        [d.device_ip]: { ...edit, unitCount: Math.max(0, parseInt(e.target.value) || 0) }
+                                                    }))}
+                                                />
+                                                <div className="flex flex-col gap-1">
+                                                    <label className="flex items-center gap-1.5 text-[11px] font-semibold text-muted uppercase tracking-wide">
+                                                        <Hash size={14} />
+                                                        Elevator IDs (one per line)
+                                                    </label>
+                                                    <textarea
+                                                        className="input text-sm py-2 px-3 min-h-[80px] resize-y"
+                                                        placeholder={"ELEV-A\nELEV-B"}
+                                                        value={edit.unitIdsText}
+                                                        onChange={e => setPendingEdits(prev => ({
+                                                            ...prev,
+                                                            [d.device_ip]: { ...edit, unitIdsText: e.target.value }
+                                                        }))}
+                                                    />
+                                                    <div className="text-[11px] text-muted">
+                                                        Leave blank to auto-generate from Node ID.
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )
+                                })}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Manual Registration */}
+                    <div className="glass p-3 relative overflow-hidden">
+                        <div className="absolute top-0 left-0 w-1 h-full bg-gradient-to-b from-emerald-500 to-cyan-500" />
+                        <h3 className="font-semibold text-xs flex items-center gap-2 mb-2">
+                            <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 flex items-center justify-center">
+                                <Globe size={12} className="text-emerald-400" />
+                            </div>
+                            Manual Registration
+                        </h3>
+
+                        <div className="flex flex-col gap-3">
+                            <FormField
+                                label="Node ID"
+                                icon={<Hash size={14} />}
+                                placeholder="NODE-01"
+                                value={manualNode.id}
+                                onChange={e => setManualNode(prev => ({ ...prev, id: e.target.value }))}
+                            />
+                            <FormField
+                                label="Device IP"
+                                icon={<Globe size={14} />}
+                                placeholder="192.168.1.232"
+                                value={manualNode.ip}
+                                onChange={e => setManualNode(prev => ({ ...prev, ip: e.target.value }))}
+                            />
+                            <div className="grid grid-cols-2 gap-3">
+                                <FormField
+                                    label="Building / Zone"
+                                    icon={<Building2 size={14} />}
+                                    placeholder="North Wing"
+                                    value={manualNode.building}
+                                    onChange={e => setManualNode(prev => ({ ...prev, building: e.target.value }))}
+                                />
+                                <FormField
+                                    label="Floor"
+                                    icon={<Layers size={14} />}
+                                    placeholder="0"
+                                    type="number"
+                                    value={String(manualNode.floor)}
+                                    onChange={e => setManualNode(prev => ({ ...prev, floor: parseInt(e.target.value) || 0 }))}
+                                />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                                <label className="flex items-center gap-1.5 text-[11px] font-semibold text-muted uppercase tracking-wide">
+                                    <Hash size={14} />
+                                    Elevator IDs (one per line)
+                                </label>
+                                <textarea
+                                    className="input text-sm py-2 px-3 min-h-[90px] resize-y"
+                                    placeholder={"ELEV-A\nELEV-B\nELEV-C"}
+                                    value={manualNode.unitIdsText}
+                                    onChange={e => setManualNode(prev => ({ ...prev, unitIdsText: e.target.value }))}
+                                />
+                            </div>
+                        </div>
+
+                        <button className="btn btn-primary w-full justify-center text-xs py-1.5 mt-2" onClick={registerNodeManually}>
+                            {showNodeSuccess ? (
+                                <><CheckCircle size={14} /> Saved!</>
+                            ) : (
+                                <><Plus size={14} /> Register Node</>
                             )}
+                        </button>
+                    </div>
+
+                    {/* Add Elevator Form */}
+                    <div className="glass p-3 relative overflow-hidden">
+                        <div className="absolute top-0 left-0 w-1 h-full bg-gradient-to-b from-violet-500 to-cyan-500" />
+                        <h3 className="font-semibold text-xs flex items-center gap-2 mb-2">
+                            <div className="w-6 h-6 rounded-lg bg-gradient-to-br from-violet-500/20 to-cyan-500/20 flex items-center justify-center">
+                                <DoorOpen size={12} className="text-violet-400" />
+                            </div>
+                            Add Elevator
+                        </h3>
+
+                        <div className="flex flex-col gap-2">
+                            <div className="flex flex-col gap-1">
+                                <label className="flex items-center gap-1.5 text-[10px] font-semibold text-muted uppercase tracking-wide ml-1">
+                                    <HardDrive size={12} />
+                                    Parent Node
+                                </label>
+                                <select
+                                    className="input text-xs py-1.5"
+                                    value={newElevator.nodeId}
+                                    onChange={e => setNewElevator({ ...newElevator, nodeId: e.target.value })}
+                                >
+                                    <option value="">Select a node</option>
+                                    {elevators.map(el => (
+                                        <option key={el.id} value={el.id}>{el.id} - {el.building}</option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            <FormField
+                                label="Elevator Label"
+                                icon={<DoorOpen size={14} />}
+                                placeholder="Elevator A"
+                                value={newElevator.label}
+                                onChange={e => setNewElevator({ ...newElevator, label: e.target.value })}
+                            />
+
+                            <button className="btn btn-primary w-full justify-center text-xs py-1.5 mt-1" onClick={addElevatorToNode}>
+                                {showElevatorSuccess ? (
+                                    <><CheckCircle size={14} /> Added!</>
+                                ) : (
+                                    <><Plus size={14} /> Add Elevator</>
+                                )}
+                            </button>
                         </div>
                     </div>
-                </div>
 
-                {/* Spatial Mapping Canvas */}
+                    {/* Node List */}
+                    <div className="glass p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="font-semibold text-sm flex items-center gap-2">
+                                <div className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center">
+                                    <Terminal size={12} className="text-tertiary" />
+                                </div>
+                                Nodes & Elevators
+                            </h3>
+                            <span className="badge font-mono text-xs">{elevators.length}</span>
+                        </div>
+
+                        <div className="flex flex-col gap-2">
+
+                            {elevators.map((node) => (
+                                <div key={node.id} className="mb-2">
+                                    {/* Node row - with edit mode */}
+                                    {editingNode?.id === node.id ? (
+                                        <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/30 space-y-2">
+                                            <div className="flex gap-2">
+                                                <input
+                                                    className="input text-xs py-1 px-2 flex-1"
+                                                    placeholder="Node ID"
+                                                    value={editingNode.newId}
+                                                    onChange={e => setEditingNode({ ...editingNode, newId: e.target.value })}
+                                                />
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <input
+                                                    className="input text-xs py-1 px-2 flex-1"
+                                                    placeholder="Building"
+                                                    value={editingNode.building}
+                                                    onChange={e => setEditingNode({ ...editingNode, building: e.target.value })}
+                                                />
+                                                <input
+                                                    className="input text-xs py-1 px-2 w-16"
+                                                    type="number"
+                                                    placeholder="Floor"
+                                                    value={editingNode.floor}
+                                                    onChange={e => setEditingNode({ ...editingNode, floor: parseInt(e.target.value) || 0 })}
+                                                />
+                                            </div>
+                                            <div className="flex gap-2 justify-end">
+                                                <button
+                                                    className="btn btn-ghost text-xs py-1 px-2"
+                                                    onClick={() => setEditingNode(null)}
+                                                >
+                                                    <X size={12} /> Cancel
+                                                </button>
+                                                <button
+                                                    className="btn btn-primary text-xs py-1 px-2"
+                                                    onClick={saveEditNode}
+                                                >
+                                                    <CheckCircle size={12} /> Save
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <div className="flex items-center justify-between p-3 rounded-xl bg-white/[0.03] border border-white/10">
+                                            <div className="flex items-center gap-3">
+                                                <HardDrive size={14} className="text-blue-400" />
+                                                <div>
+                                                    <p className="text-sm font-bold">{node.id}</p>
+                                                    <p className="text-xs text-muted">{node.building} • FL {node.floor}</p>
+                                                </div>
+                                            </div>
+                                            <div className="flex gap-1">
+                                                <button
+                                                    onClick={() => startEditNode(node)}
+                                                    className="p-2 rounded-lg text-muted hover:text-blue-400 hover:bg-blue-400/10"
+                                                >
+                                                    <Edit2 size={12} />
+                                                </button>
+                                                <button
+                                                    onClick={() => removeNode(node.id)}
+                                                    className="p-2 rounded-lg text-muted hover:text-danger hover:bg-danger/10"
+                                                >
+                                                    <Trash2 size={12} />
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+                                    
+                                    {/* Elevator units */}
+                                    {node.elevators && node.elevators.length > 0 && (
+                                        <div className="ml-6 mt-1 space-y-1">
+                                            {node.elevators.map((elev) => (
+                                                editingUnit?.id === elev.id ? (
+                                                    <div key={elev.id} className="p-2 rounded-lg bg-violet-500/10 border border-violet-500/30 space-y-2">
+                                                        <div className="flex gap-2">
+                                                            <input
+                                                                className="input text-xs py-1 px-2 flex-1"
+                                                                placeholder="Elevator ID"
+                                                                value={editingUnit.newId}
+                                                                onChange={e => setEditingUnit({ ...editingUnit, newId: e.target.value })}
+                                                            />
+                                                            <input
+                                                                className="input text-xs py-1 px-2 flex-1"
+                                                                placeholder="Label"
+                                                                value={editingUnit.label}
+                                                                onChange={e => setEditingUnit({ ...editingUnit, label: e.target.value })}
+                                                            />
+                                                        </div>
+                                                        <div className="flex gap-2 justify-end">
+                                                            <button
+                                                                className="btn btn-ghost text-xs py-1 px-2"
+                                                                onClick={() => setEditingUnit(null)}
+                                                            >
+                                                                <X size={10} /> Cancel
+                                                            </button>
+                                                            <button
+                                                                className="btn btn-primary text-xs py-1 px-2"
+                                                                onClick={saveEditUnit}
+                                                            >
+                                                                <CheckCircle size={10} /> Save
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div key={elev.id} className="flex items-center justify-between p-2 rounded-lg bg-white/[0.02]">
+                                                        <div className="flex items-center gap-2">
+                                                            <DoorOpen size={12} className="text-violet-400" />
+                                                            <span className="text-xs">{elev.label}</span>
+                                                            {elev.id !== elev.label && (
+                                                                <span className="text-[10px] text-muted">({elev.id})</span>
+                                                            )}
+                                                        </div>
+                                                        <div className="flex gap-1">
+                                                            <button
+                                                                onClick={() => startEditUnit(node.id, elev)}
+                                                                className="p-1 rounded text-muted hover:text-violet-400"
+                                                            >
+                                                                <Edit2 size={10} />
+                                                            </button>
+                                                            <button
+                                                                onClick={() => removeElevatorUnit(node.id, elev.id)}
+                                                                className="p-1 rounded text-muted hover:text-danger"
+                                                            >
+                                                                <Trash2 size={10} />
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                    </div>{/* End of scrollable wrapper */}
+                </div>{/* End of left control panel */}
+
+                {/* Canvas */}
                 <div className="col-span-8 glass relative flex flex-col overflow-hidden">
-                    {/* Canvas Header */}
                     <div className="p-5 border-b flex items-center justify-between bg-black/20">
                         <div className="flex items-center gap-3">
                             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500/20 to-cyan-500/20 flex items-center justify-center">
@@ -283,81 +852,87 @@ export default function DashboardBuilder({ elevators, onElevatorsChange }: Props
                         </div>
                     </div>
 
-                    {/* Canvas Area */}
-                    <div className="flex-1 relative canvas-grid overflow-hidden">
-                        {/* Drag Hint */}
-                        {elevators.length === 0 && (
+                    <div 
+                        ref={canvasRef}
+                        className="flex-1 relative canvas-grid overflow-hidden"
+                        onWheel={handleWheel}
+                        onMouseDown={handleMouseDown}
+                        onMouseMove={handleMouseMove}
+                        onMouseUp={handleMouseUp}
+                        onMouseLeave={handleMouseUp}
+                        style={{ cursor: isDragging ? 'grabbing' : 'grab', userSelect: 'none' }}
+                    >
+                        {elevators.length === 0 ? (
                             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                                <motion.div
-                                    animate={{ y: [0, -10, 0], opacity: [0.1, 0.2, 0.1] }}
-                                    transition={{ duration: 3, repeat: Infinity }}
+                                <Move size={80} className="text-white opacity-10 mb-4" />
+                                <p className="text-muted text-sm">Nodes and elevators will appear here</p>
+                            </div>
+                        ) : (
+                            <div
+                                style={{
+                                    transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                                    transformOrigin: '0 0',
+                                    width: '100%',
+                                    height: '100%',
+                                    position: 'relative'
+                                }}
+                            >
+                                {/* SVG Layer for Lines */}
+                                <svg
+                                    style={{
+                                        position: 'absolute',
+                                        left: 0,
+                                        top: 0,
+                                        width: '100%',
+                                        height: '100%',
+                                        pointerEvents: 'none',
+                                        zIndex: 0,
+                                        overflow: 'visible'
+                                    }}
                                 >
-                                    <Move size={80} className="text-white mb-4" />
-                                </motion.div>
-                                <p className="text-muted text-sm">Nodes will appear here for spatial mapping</p>
+                                    {elevators.map((node) => 
+                                        node.elevators?.map((elevator) => (
+                                            <line
+                                                key={`line-${elevator.id}`}
+                                                x1={node.x + 80}
+                                                y1={node.y + 80}
+                                                x2={elevator.x + 64}
+                                                y2={elevator.y + 48}
+                                                stroke="rgba(139, 92, 246, 0.4)"
+                                                strokeWidth="2"
+                                            />
+                                        ))
+                                    )}
+                                </svg>
+                                
+                                {elevators.map((node) => (
+                                    <div key={node.id}>
+                                        {/* Node */}
+                                        <DraggableNode
+                                            node={node}
+                                            zoom={zoom}
+                                            onDragEnd={(offsetX, offsetY) => handleItemDragEnd(node.id, 'node', null, offsetX, offsetY)}
+                                        />
+                                        
+                                        {/* Elevators */}
+                                        {node.elevators?.map((elevator) => (
+                                            <DraggableElevator
+                                                key={elevator.id}
+                                                elevator={elevator}
+                                                zoom={zoom}
+                                                onDragEnd={(offsetX, offsetY) => handleItemDragEnd(elevator.id, 'elevator', node.id, offsetX, offsetY)}
+                                            />
+                                        ))}
+                                    </div>
+                                ))}
                             </div>
                         )}
-
-                        {/* Draggable Nodes */}
-                        <AnimatePresence>
-                            {elevators.map((el) => (
-                                <motion.div
-                                    key={el.id}
-                                    drag
-                                    dragMomentum={false}
-                                    initial={{ scale: 0, opacity: 0 }}
-                                    animate={{ scale: 1, opacity: 1 }}
-                                    exit={{ scale: 0, opacity: 0 }}
-                                    whileDrag={{ scale: 1.08, zIndex: 50, cursor: 'grabbing' }}
-                                    whileHover={{ scale: 1.02 }}
-                                    onDragEnd={(_, info) => {
-                                        const newX = el.x + info.offset.x
-                                        const newY = el.y + info.offset.y
-                                        updatePosition(el.id, newX, newY)
-                                    }}
-                                    className="absolute cursor-grab active:cursor-grabbing"
-                                    style={{ left: el.x, top: el.y }}
-                                >
-                                    <div className={`w-40 glass-card p-4 flex flex-col items-center text-center group ${el.status === 'emergency' ? 'border-danger/40' : 'border-white/10'}`}>
-                                        {/* Status Dot */}
-                                        <div
-                                            className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
-                                            style={{
-                                                background: el.status === 'emergency' ? 'var(--danger)' :
-                                                    el.lastSeen > 0 ? 'var(--success)' : 'var(--text-muted)',
-                                                boxShadow: el.status === 'emergency' ? '0 0 8px rgba(239, 68, 68, 0.5)' :
-                                                    el.lastSeen > 0 ? '0 0 8px rgba(16, 185, 129, 0.5)' : 'none'
-                                            }}
-                                        />
-
-                                        <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center mb-3 group-hover:bg-blue-500/10 transition-colors">
-                                            <HardDrive size={18} className="text-muted group-hover:text-blue-400 transition-colors" />
-                                        </div>
-
-                                        <span className="text-xs font-bold uppercase tracking-tight mb-1 group-hover:text-blue-400 transition-colors">
-                                            {el.id}
-                                        </span>
-                                        <span className="text-xs text-tertiary font-mono mb-1">
-                                            {el.ip_address}
-                                        </span>
-                                        <span className="text-xs text-muted font-medium uppercase tracking-wider">
-                                            {el.building}
-                                        </span>
-
-                                        <div className="mt-2 px-2.5 py-1 rounded-md bg-black/30 text-xs font-mono text-tertiary">
-                                            FL {el.floor}
-                                        </div>
-                                    </div>
-                                </motion.div>
-                            ))}
-                        </AnimatePresence>
                     </div>
 
-                    {/* Canvas Footer */}
                     <div className="p-4 bg-black/30 border-t flex justify-between text-xs font-mono text-muted">
-                        <span>REAL-TIME SYNC: ENABLED</span>
-                        <span>GRID: 32×32px</span>
-                        <span>DRAG NODES TO REPOSITION</span>
+                        <span>REAL-TIME SYNC</span>
+                        <span>ZOOM: {(zoom * 100).toFixed(0)}%</span>
+                        <span>SCROLL TO ZOOM • DRAG TO PAN</span>
                     </div>
                 </div>
             </div>
@@ -365,14 +940,168 @@ export default function DashboardBuilder({ elevators, onElevatorsChange }: Props
     )
 }
 
-function FormField({
-    label,
-    icon,
-    placeholder,
-    value,
-    onChange,
-    type = 'text'
-}: {
+function DraggableNode({ node, zoom, onDragEnd }: { node: Elevator, zoom: number, onDragEnd: (offsetX: number, offsetY: number) => void }) {
+    const [isDragging, setIsDragging] = useState(false)
+    const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 })
+    const [startPos, setStartPos] = useState({ x: 0, y: 0 })
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        setIsDragging(true)
+        setStartPos({ x: e.clientX, y: e.clientY })
+        setDragOffset({ x: 0, y: 0 })
+    }
+
+    const handleMouseMove = (e: MouseEvent) => {
+        if (isDragging) {
+            setDragOffset({
+                x: e.clientX - startPos.x,
+                y: e.clientY - startPos.y
+            })
+        }
+    }
+
+    const handleMouseUp = () => {
+        if (isDragging) {
+            onDragEnd(dragOffset.x, dragOffset.y)
+            setIsDragging(false)
+            setDragOffset({ x: 0, y: 0 })
+        }
+    }
+
+    useEffect(() => {
+        if (isDragging) {
+            document.addEventListener('mousemove', handleMouseMove)
+            document.addEventListener('mouseup', handleMouseUp)
+            return () => {
+                document.removeEventListener('mousemove', handleMouseMove)
+                document.removeEventListener('mouseup', handleMouseUp)
+            }
+        }
+    }, [isDragging, dragOffset])
+
+    const isEmergency = node.status === 'emergency'
+    const isOnline = node.lastSeen > 0 && Date.now() - node.lastSeen < 60000
+    const statusColor = isEmergency ? 'var(--danger)' : isOnline ? 'var(--success)' : 'var(--text-muted)'
+
+    return (
+        <div
+            className="absolute draggable-item cursor-grab active:cursor-grabbing"
+            style={{ 
+                left: node.x + dragOffset.x / zoom, 
+                top: node.y + dragOffset.y / zoom,
+                zIndex: isDragging ? 1000 : 1,
+                userSelect: 'none'
+            }}
+            onMouseDown={handleMouseDown}
+        >
+            <div className={`w-40 glass-card relative p-4 flex flex-col items-center text-center group ${isEmergency ? 'border-danger/40' : 'border-white/10'}`}>
+                {/* Live Status Indicator - Top Left */}
+                <div className="absolute top-3 left-3 flex items-center gap-1.5">
+                    <div
+                        className="w-2 h-2 rounded-full"
+                        style={{
+                            background: isOnline ? 'var(--success)' : 'var(--danger)',
+                            boxShadow: isOnline ? '0 0 6px rgba(16, 185, 129, 0.6)' : '0 0 6px rgba(239, 68, 68, 0.4)'
+                        }}
+                    />
+                    <span
+                        className="text-xs font-mono"
+                        style={{ color: isOnline ? 'var(--success)' : 'var(--danger)' }}
+                    >
+                        {isOnline ? 'LIVE' : 'OFF'}
+                    </span>
+                </div>
+                
+                {/* Emergency Status Indicator - Top Right */}
+                <div
+                    className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
+                    style={{
+                        background: statusColor,
+                        boxShadow: isEmergency ? '0 0 8px rgba(239, 68, 68, 0.5)' : 'none',
+                        display: isEmergency ? 'block' : 'none'
+                    }}
+                />
+                <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center mb-3">
+                    <HardDrive size={18} className="text-muted" />
+                </div>
+                <span className="text-xs font-bold uppercase tracking-tight mb-1">{node.id}</span>
+                <span className="text-xs text-tertiary font-mono mb-1">{node.ip_address}</span>
+                <span className="text-xs text-muted font-medium uppercase tracking-wider">{node.building}</span>
+                <div className="mt-2 px-2.5 py-1 rounded-md bg-black/30 text-xs font-mono text-tertiary">
+                    FL {node.floor}
+                </div>
+            </div>
+        </div>
+    )
+}
+
+function DraggableElevator({ elevator, zoom, onDragEnd }: { elevator: ElevatorUnit, zoom: number, onDragEnd: (offsetX: number, offsetY: number) => void }) {
+    const [isDragging, setIsDragging] = useState(false)
+    const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 })
+    const [startPos, setStartPos] = useState({ x: 0, y: 0 })
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        setIsDragging(true)
+        setStartPos({ x: e.clientX, y: e.clientY })
+        setDragOffset({ x: 0, y: 0 })
+    }
+
+    const handleMouseMove = (e: MouseEvent) => {
+        if (isDragging) {
+            setDragOffset({
+                x: e.clientX - startPos.x,
+                y: e.clientY - startPos.y
+            })
+        }
+    }
+
+    const handleMouseUp = () => {
+        if (isDragging) {
+            onDragEnd(dragOffset.x, dragOffset.y)
+            setIsDragging(false)
+            setDragOffset({ x: 0, y: 0 })
+        }
+    }
+
+    useEffect(() => {
+        if (isDragging) {
+            document.addEventListener('mousemove', handleMouseMove)
+            document.addEventListener('mouseup', handleMouseUp)
+            return () => {
+                document.removeEventListener('mousemove', handleMouseMove)
+                document.removeEventListener('mouseup', handleMouseUp)
+            }
+        }
+    }, [isDragging, dragOffset])
+
+    const statusColor = elevator.status === 'emergency' ? 'var(--danger)' : 'var(--success)'
+
+    return (
+        <div
+            className="absolute draggable-item cursor-grab active:cursor-grabbing"
+            style={{ 
+                left: elevator.x + dragOffset.x / zoom, 
+                top: elevator.y + dragOffset.y / zoom,
+                zIndex: isDragging ? 1000 : 1,
+                userSelect: 'none'
+            }}
+            onMouseDown={handleMouseDown}
+        >
+            <div className={`w-32 glass-card p-3 flex flex-col items-center text-center ${elevator.status === 'emergency' ? 'border-danger/40' : 'border-white/10'}`}>
+                <div
+                    className="absolute top-2 right-2 w-2 h-2 rounded-full"
+                    style={{ background: statusColor }}
+                />
+                <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center mb-2">
+                    <DoorOpen size={16} className={elevator.status === 'emergency' ? "text-danger" : "text-violet-400"} />
+                </div>
+                <span className="text-xs font-bold uppercase tracking-tight">{elevator.label}</span>
+            </div>
+        </div>
+    )
+}
+
+function FormField({ label, icon, placeholder, value, onChange, type = 'text' }: {
     label: string;
     icon: React.ReactNode;
     placeholder: string;
@@ -381,13 +1110,13 @@ function FormField({
     type?: string;
 }) {
     return (
-        <div className="flex flex-col gap-2">
-            <label className="flex items-center gap-2 text-xs font-semibold text-muted uppercase tracking-wide ml-1">
+        <div className="flex flex-col gap-1">
+            <label className="flex items-center gap-1.5 text-[11px] font-semibold text-muted uppercase tracking-wide">
                 {icon}
                 {label}
             </label>
             <input
-                className="input"
+                className="input text-sm py-2 px-3"
                 type={type}
                 placeholder={placeholder}
                 value={value}

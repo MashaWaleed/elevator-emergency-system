@@ -8,12 +8,13 @@
  * 3. Send periodic heartbeat/status updates
  * 
  * Usage:
- *   node test-elevator-node.mjs --id ELEV-01 --building "North Wing" --floor 5 --emergency
- *   node test-elevator-node.mjs --id ELEV-01 --heartbeat
- *   node test-elevator-node.mjs --id ELEV-01 --listen
+ *   node test-elevator-node.mjs --node NODE-01 --elevator ELEV-A --building "North Wing" --floor 5 --emergency
+ *   node test-elevator-node.mjs --node NODE-01 --elevator ELEV-A --heartbeat
+ *   node test-elevator-node.mjs --node NODE-01 --elevator ELEV-A --listen
  * 
  * Options:
- *   --id          Elevator ID (required)
+ *   --node        Node ID (required, e.g., NODE-01)
+ *   --elevator    Elevator unit ID (required, e.g., ELEV-A, ELEV-B)
  *   --building    Building name (default: "Test Building")
  *   --floor       Floor number (default: 1)
  *   --ip          IP address to report (default: auto-detect)
@@ -32,7 +33,8 @@ import { networkInterfaces } from 'os';
 // Parse command line arguments
 const args = process.argv.slice(2);
 const options = {
-    id: 'ELEV-TEST-01',
+    nodeId: 'NODE-TEST-01',
+    elevatorId: 'ELEV-A',
     building: 'Test Building',
     floor: 1,
     ip: null,
@@ -49,8 +51,14 @@ const options = {
 for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     switch (arg) {
-        case '--id':
-            options.id = args[++i];
+        case '--node':
+            options.nodeId = args[++i];
+            break;
+        case '--elevator':
+            options.elevatorId = args[++i];
+            break;
+        case '--id': // backward compatibility
+            options.nodeId = args[++i];
             break;
         case '--building':
             options.building = args[++i];
@@ -104,7 +112,8 @@ function printHelp() {
 ║    node test-elevator-node.mjs [options]                       ║
 ║                                                                ║
 ║  OPTIONS:                                                      ║
-║    --id <id>         Elevator ID (default: ELEV-TEST-01)       ║
+║    --node <id>       Node ID (default: NODE-TEST-01)           ║
+║    --elevator <id>   Elevator unit ID (default: ELEV-A)        ║
 ║    --building <name> Building name (default: Test Building)    ║
 ║    --floor <num>     Floor number (default: 1)                 ║
 ║    --ip <address>    IP to report (default: auto-detect)       ║
@@ -119,15 +128,17 @@ function printHelp() {
 ║    --interval <ms>   Heartbeat interval (default: 5000)        ║
 ║                                                                ║
 ║  EXAMPLES:                                                     ║
-║    # Trigger emergency                                         ║
-║    node test-elevator-node.mjs --id ELEV-01 --emergency        ║
+║    # Trigger emergency on elevator A of node 01                ║
+║    node test-elevator-node.mjs --node NODE-01 \\                ║
+║      --elevator ELEV-A --emergency                             ║
 ║                                                                ║
 ║    # Clear emergency                                           ║
-║    node test-elevator-node.mjs --id ELEV-01 --clear            ║
+║    node test-elevator-node.mjs --node NODE-01 \\                ║
+║      --elevator ELEV-A --clear                                 ║
 ║                                                                ║
 ║    # Heartbeat mode with listener                              ║
-║    node test-elevator-node.mjs --id ELEV-01 --heartbeat \\      ║
-║      --listen --interval 3000                                  ║
+║    node test-elevator-node.mjs --node NODE-01 \\                ║
+║      --elevator ELEV-A --heartbeat --listen                    ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
 `);
@@ -155,7 +166,8 @@ const client = dgram.createSocket('udp4');
 function createMessage(type, status) {
     return JSON.stringify({
         type: type,
-        elevator_id: options.id,
+        node_id: options.nodeId,
+        elevator_id: options.elevatorId,
         building: options.building,
         floor: options.floor,
         timestamp: new Date().toISOString(),
@@ -182,7 +194,8 @@ console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║              ELEVATOR NODE SIMULATOR ACTIVE                    ║
 ╠════════════════════════════════════════════════════════════════╣
-║  Node ID:     ${options.id.padEnd(45)}║
+║  Node ID:     ${options.nodeId.padEnd(45)}║
+║  Elevator ID: ${options.elevatorId.padEnd(45)}║
 ║  Building:    ${options.building.padEnd(45)}║
 ║  Floor:       ${options.floor.toString().padEnd(45)}║
 ║  Local IP:    ${localIP.padEnd(45)}║

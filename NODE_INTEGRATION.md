@@ -25,13 +25,16 @@ Send this packet periodically (e.g., every 5-10 seconds) to let the system know 
 ### 2. Emergency Packet
 Send this immediately when the emergency button is pressed. It is recommended to send this packet multiple times (e.g., 3 times) to ensure delivery over UDP.
 
+**IMPORTANT**: The `elevator_id` should now be the specific elevator unit ID (e.g., "ELEV-A", "ELEV-B"), and you should include the `node_id` to identify which node the elevator belongs to.
+
 ```json
 {
   "type": "emergency",
-  "elevator_id": "ELEV-01",
+  "node_id": "NODE-01",              // NEW: Node identifier
+  "elevator_id": "ELEV-A",           // Specific elevator unit ID
   "building": "North Wing",
   "floor": 5,
-  "status": "active",           // MUST be "active" to trigger alarm
+  "status": "active",                // MUST be "active" to trigger alarm
   "timestamp": "2023-12-31T12:00:10Z"
 }
 ```
@@ -43,12 +46,25 @@ When an operator acknowledges the alarm in the dashboard, the system sends a UDP
 ```json
 {
   "type": "acknowledgment",
-  "elevator_id": "ELEV-01",
+  "node_id": "NODE-01",
+  "elevator_id": "ELEV-A",
   "operator": "Station-1",
   "status": "acknowledged",
   "timestamp": "2023-12-31T12:00:25Z"
 }
 ```
+
+---
+
+## Updated System Architecture
+
+The system now supports:
+- **Nodes**: Physical controller units with network addresses (e.g., NODE-01, NODE-02)
+- **Elevator Units**: Individual elevators linked to nodes (e.g., ELEV-A, ELEV-B on NODE-01)
+
+Each node can have multiple elevator units. When sending emergency packets, include both:
+- `node_id`: The controller node identifier
+- `elevator_id`: The specific elevator unit that triggered the emergency
 
 ---
 
@@ -71,7 +87,8 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 def send_emergency():
     payload = {
         "type": "emergency",
-        "elevator_id": MY_ID,
+        "node_id": "NODE-01",        # Node identifier
+        "elevator_id": "ELEV-A",     # Specific elevator unit
         "building": "Building A",
         "floor": 1,
         "status": "active",
@@ -93,7 +110,8 @@ const client = dgram.createSocket('udp4');
 
 const message = JSON.stringify({
     type: "emergency",
-    elevator_id: "ELEV-01",
+    node_id: "NODE-01",
+    elevator_id: "ELEV-A",
     building: "Building A",
     floor: 3,
     status: "active",

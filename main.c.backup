@@ -1,0 +1,491 @@
+#include <string.h>
+#include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include "esp_netif.h"
+#include "esp_eth.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "sdkconfig.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+
+// Ethernet configuration
+#define ETH_PHY_ADDR 1
+#define ETH_MDC_GPIO 23
+#define ETH_MDIO_GPIO 18
+#define PORT 80
+
+// Elevator Node Configuration
+#define NODE_ID "NODE-ESP32"
+#define ELEVATOR_ID "ELEVATOR-A"
+#define BUILDING "ESP32 Building"
+#define FLOOR 1
+#define SERVER_IP "192.168.1.11"  // Change to your monitoring server IP
+#define SERVER_PORT 5000
+#define ACK_LISTEN_PORT 5001  // Port to listen for acknowledgments from server
+#define HEARTBEAT_INTERVAL_MS 5000  // 5 seconds
+
+// Emergency Button GPIOs (HIGH = pressed)
+#define BUTTON_GPIO_1 15
+#define BUTTON_GPIO_2 16
+#define BUTTON_GPIO_3 13
+#define BUTTON_GPIO_4 4
+#define BUTTON_GPIO_5 14
+#define BUTTON_GPIO_6 39
+#define BUTTON_GPIO_7 36
+
+#define DEBOUNCE_MS 50  // Debounce time in milliseconds
+
+static const char *TAG = "elevator_node";
+static int req_count = 0;
+static char local_ip[16] = "0.0.0.0";
+static bool emergency_active = false;
+static bool emergency_button_pressed = false;  // Current button state
+static TimerHandle_t heartbeat_timer = NULL;
+static int udp_sock = -1;
+static int ack_listen_sock = -1;
+
+/** Event handler for Ethernet events */
+static void eth_event_handler(void *arg, esp_event_base_t event_base,
+                              int32_t event_id, void *event_data)
+{
+    uint8_t mac_addr[6] = {0};
+    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
+
+    switch (event_id) {
+    case ETHERNET_EVENT_CONNECTED:
+        esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
+        ESP_LOGI(TAG, "Ethernet Link Up");
+        ESP_LOGI(TAG, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        break;
+    case ETHERNET_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "Ethernet Link Down");
+        break;
+    case ETHERNET_EVENT_START:
+        ESP_LOGI(TAG, "Ethernet Started");
+        break;
+    case ETHERNET_EVENT_STOP:
+        ESP_LOGI(TAG, "Ethernet Stopped");
+        break;
+    default:
+        break;
+    }
+}
+
+/** Event handler for IP_EVENT_ETH_GOT_IP */
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
+                                 int32_t event_id, void *event_data)
+{
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+    const esp_netif_ip_info_t *ip_info = &event->ip_info;
+
+    ESP_LOGI(TAG, "Ethernet Got IP Address");
+    ESP_LOGI(TAG, "~~~~~~~~~~~");
+    ESP_LOGI(TAG, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
+    ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
+    ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
+    ESP_LOGI(TAG, "~~~~~~~~~~~");
+    
+    // Store local IP for UDP messages
+    snprintf(local_ip, sizeof(local_ip), IPSTR, IP2STR(&ip_info->ip));
+    ESP_LOGI(TAG, "Local IP stored: %s", local_ip);
+}
+
+// Send UDP message to monitoring server
+static void send_udp_message(const char *message)
+{
+    if (udp_sock < 0) {
+        ESP_LOGW(TAG, "UDP socket not initialized");
+        return;
+    }
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(SERVER_PORT);
+
+    int err = sendto(udp_sock, message, strlen(message), 0, 
+                     (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0) {
+        ESP_LOGE(TAG, "Failed to send UDP message: errno %d", errno);
+    } else {
+        ESP_LOGI(TAG, "Sent UDP: %s", message);
+    }
+}
+
+// Get current timestamp in ISO 8601 format
+static void get_timestamp(char *buffer, size_t size)
+{
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    gmtime_r(&now, &timeinfo);
+    strftime(buffer, size, "%Y-%m-%dT%H:%M:%S.000Z", &timeinfo);
+}
+
+// Send heartbeat signal
+static void send_heartbeat(void)
+{
+    char timestamp[32];
+    char message[512];
+    
+    get_timestamp(timestamp, sizeof(timestamp));
+    
+    snprintf(message, sizeof(message),
+             "{\"type\":\"heartbeat\","
+             "\"node_id\":\"%s\","
+             "\"elevator_id\":\"%s\","
+             "\"building\":\"%s\","
+             "\"floor\":%d,"
+             "\"timestamp\":\"%s\","
+             "\"status\":\"online\","
+             "\"ip_address\":\"%s\"}",
+             NODE_ID, ELEVATOR_ID, BUILDING, FLOOR, timestamp, local_ip);
+    
+    send_udp_message(message);
+}
+
+// Send emergency signal
+static void send_emergency(bool active)
+{
+    char timestamp[32];
+    char message[512];
+    
+    get_timestamp(timestamp, sizeof(timestamp));
+    
+    snprintf(message, sizeof(message),
+             "{\"type\":\"emergency\","
+             "\"node_id\":\"%s\","
+             "\"elevator_id\":\"%s\","
+             "\"building\":\"%s\","
+             "\"floor\":%d,"
+             "\"timestamp\":\"%s\","
+             "\"status\":\"%s\","
+             "\"ip_address\":\"%s\"}",
+             NODE_ID, ELEVATOR_ID, BUILDING, FLOOR, timestamp, 
+             active ? "active" : "acknowledged", local_ip);
+    
+    send_udp_message(message);
+}
+
+// Heartbeat timer callback
+static void heartbeat_timer_callback(TimerHandle_t xTimer)
+{
+    send_heartbeat();
+}
+
+// GPIO button monitoring task
+static void gpio_monitor_task(void *pvParameters)
+{
+    const int button_gpios[] = {BUTTON_GPIO_1, BUTTON_GPIO_2, BUTTON_GPIO_3, 
+                                  BUTTON_GPIO_4, BUTTON_GPIO_5, BUTTON_GPIO_6, BUTTON_GPIO_7};
+    const int num_buttons = sizeof(button_gpios) / sizeof(button_gpios[0]);
+    bool last_states[7] = {false};
+    uint32_t debounce_times[7] = {0};
+    
+    ESP_LOGI(TAG, "GPIO monitor task started");
+    
+    while (1) {
+        bool any_pressed = false;
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        
+        for (int i = 0; i < num_buttons; i++) {
+            int level = gpio_get_level(button_gpios[i]);
+            bool pressed = (level == 1);  // HIGH = pressed
+            
+            // Debounce logic
+            if (pressed != last_states[i]) {
+                if (current_time - debounce_times[i] > DEBOUNCE_MS) {
+                    last_states[i] = pressed;
+                    debounce_times[i] = current_time;
+                    
+                    if (pressed) {
+                        ESP_LOGW(TAG, "Emergency button %d (GPIO %d) PRESSED!", 
+                                i + 1, button_gpios[i]);
+                    } else {
+                        ESP_LOGI(TAG, "Emergency button %d (GPIO %d) released", 
+                                i + 1, button_gpios[i]);
+                    }
+        LOGI(TAG, "╔═══════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║      ELEVATOR EMERGENCY NODE - ESP32-ETH01            ║");
+    ESP_LOGI(TAG, "╠═══════════════════════════════════════════════════════╣");
+    ESP_LOGI(TAG, "║  Node ID:     %-40s║", NODE_ID);
+    ESP_LOGI(TAG, "║  Elevator ID: %-40s║", ELEVATOR_ID);
+    ESP_LOGI(TAG, "║  Building:    %-40s║", BUILDING);
+    ESP_LOGI(TAG, "║  Floor:       %-40d║", FLOOR);
+    ESP_LOGI(TAG, "║  Server:      %-40s║", SERVER_IP);
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════════╝");
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Create default event loop for Ethernet
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&cfg);
+
+    // Init MAC and PHY configs to default
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+
+    phy_config.phy_addr = ETH_PHY_ADDR;
+    phy_config.reset_gpio_num = -1;
+
+    // Use new smi_gpio structure instead of deprecated fields
+    eth_esp32_emac_config_t esp32_emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    esp32_emac_config.smi_gpio.mdc_num = ETH_MDC_GPIO;
+    esp32_emac_config.smi_gpio.mdio_num = ETH_MDIO_GPIO;
+    // Custom board uses GPIO17 to OUTPUT the 50MHz clock to the PHY
+    esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_OUT;
+    esp32_emac_config.clock_config.rmii.clock_gpio = EMAC_CLK_OUT_180_GPIO; // GPIO17
+
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
+
+    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+
+    // Attach driver to network interface and register event handlers
+    esp_eth_netif_glue_handle_t eth_glue = esp_eth_new_netif_glue(eth_handle);
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, eth_glue));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
+
+    // Configure static IP (optional - comment out for DHCP)
+    esp_netif_dhcpc_stop(eth_netif);
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 1, 232);
+    IP4_ADDR(&ip_info.gw, 192, 168, 1, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    esp_netif_set_ip_info(eth_netif, &ip_info);
+    
+    // Store static IP
+    snprintf(local_ip, sizeof(local_ip), "192.168.1.232");
+
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    // Initialize elevator node functionality
+    ESP_LOGI(TAG, "Initializing elevator node systems...");
+    
+    // Initialize GPIO buttons for emergency detection
+    init_gpio_buttons();
+    
+    // Initialize UDP socket for communication
+    init_udp_socket();
+    
+    // Wait for network to be ready
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Start heartbeat timer
+    start_heartbeat_timer();
+    
+    // Send initial heartbeat
+    send_heartbeat();
+    
+    // Start GPIO monitoring task
+    xTaskCreate(gpio_monitor_task, "gpio_monitor", 4096, NULL, 5, NULL);
+    
+    // Optional: Start web server for diagnostics
+    xTaskCreate(tcp_server_task, "tcp_server", 4096, (void *)AF_INET, 5, NULL);
+    
+    ESP_LOGI(TAG, "✓ Elevator node initialized successfully");
+    ESP_LOGI(TAG, "  Monitoring %d emergency buttons", 7);
+    ESP_LOGI(TAG, "  Sending heartbeats every %d seconds", HEARTBEAT_INTERVAL_MS / 1000
+    };
+    
+    for (int i = 0; i < num_buttons; i++) {
+        io_conf.pin_bit_mask = (1ULL << button_gpios[i]);
+        gpio_config(&io_conf);
+        ESP_LOGI(TAG, "Configured GPIO %d as input with pull-down", button_gpios[i]);
+    }
+}
+
+// Start heartbeat timer
+static void start_heartbeat_timer(void)
+{
+    heartbeat_timer = xTimerCreate("heartbeat", 
+                                   pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS),
+                                   pdTRUE,  // Auto-reload
+                                   NULL,
+                                   heartbeat_timer_callback);
+    
+    if (heartbeat_timer != NULL) {
+        xTimerStart(heartbeat_timer, 0);
+        ESP_LOGI(TAG, "Heartbeat timer started (interval: %d ms)", HEARTBEAT_INTERVAL_MS);
+    } else {
+        ESP_LOGE(TAG, "Failed to create heartbeat timer");
+    }
+}
+
+static void tcp_server_task(void *pvParameters)
+{
+    char addr_str[128];
+    int addr_family = AF_INET;
+    int ip_protocol = 0;
+    int keepAlive = 1;
+    int keepIdle = 5;
+    int keepInterval = 5;
+    int keepCount = 3;
+    struct sockaddr_storage dest_addr;
+
+    struct sockaddr_in *dest_addr_ip4 = (struct sockaddr_in *)&dest_addr;
+    dest_addr_ip4->sin_addr.s_addr = htonl(INADDR_ANY);
+    dest_addr_ip4->sin_family = AF_INET;
+    dest_addr_ip4->sin_port = htons(PORT);
+    ip_protocol = IPPROTO_IP;
+
+    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
+    if (listen_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    ESP_LOGI(TAG, "Socket created");
+
+    int err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err != 0) {
+        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+        ESP_LOGE(TAG, "IPPROTO: %d", addr_family);
+        goto CLEAN_UP;
+    }
+    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
+
+    err = listen(listen_sock, 1);
+    if (err != 0) {
+        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
+        goto CLEAN_UP;
+    }
+
+    while (1) {
+        ESP_LOGI(TAG, "Socket listening");
+
+        struct sockaddr_storage source_addr;
+        socklen_t addr_len = sizeof(source_addr);
+        int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+            break;
+        }
+
+        // Set tcp keepalive option
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+
+        // Convert ip address to string
+        if (source_addr.ss_family == PF_INET) {
+            inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+        }
+
+        ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
+
+        char rx_buffer[128];
+        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+        if (len < 0) {
+            ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
+        } else if (len == 0) {
+            ESP_LOGI(TAG, "Connection closed");
+        } else {
+            rx_buffer[len] = 0; // Null-terminate
+            ESP_LOGI(TAG, "Received %d bytes: %s", len, rx_buffer);
+
+            // Send HTTP response
+            req_count++;
+            char response[512];
+            snprintf(response, sizeof(response),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: text/html\r\n"
+                     "Connection: close\r\n"
+                     "Refresh: 20\r\n"
+                     "\r\n"
+                     "<!DOCTYPE HTML>\r\n"
+                     "<html>\r\n"
+                     "<h2>Hello World from ESP32-WT32-ETH01!</h2>\r\n"
+                     "Requests received: %d<br>\r\n"
+                     "<br>\r\n"
+                     "</html>\r\n",
+                     req_count);
+
+            int total = strlen(response);
+            int to_write = total;
+            int offset = 0;
+            while (to_write > 0) {
+                int written = send(sock, response + offset, to_write, 0);
+                if (written < 0) {
+                    ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+                    break;
+                }
+                to_write -= written;
+                offset += written;
+            }
+            ESP_LOGI(TAG, "Sent %d/%d bytes", offset, total);
+        }
+
+        shutdown(sock, SHUT_RDWR);
+        close(sock);
+    }
+
+CLEAN_UP:
+    close(listen_sock);
+    vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // Create default event loop for Ethernet
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&cfg);
+
+    // Init MAC and PHY configs to default
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+
+    phy_config.phy_addr = ETH_PHY_ADDR;
+    phy_config.reset_gpio_num = -1;
+
+    // Use new smi_gpio structure instead of deprecated fields
+    eth_esp32_emac_config_t esp32_emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    esp32_emac_config.smi_gpio.mdc_num = ETH_MDC_GPIO;
+    esp32_emac_config.smi_gpio.mdio_num = ETH_MDIO_GPIO;
+    // Custom board uses GPIO17 to OUTPUT the 50MHz clock to the PHY
+    esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_OUT;
+    esp32_emac_config.clock_config.rmii.clock_gpio = EMAC_CLK_OUT_180_GPIO; // GPIO17
+
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_config);
+
+    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+
+    // Attach driver to network interface and register event handlers
+    esp_eth_netif_glue_handle_t eth_glue = esp_eth_new_netif_glue(eth_handle);
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, eth_glue));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
+
+    // Configure static IP (optional - comment out for DHCP)
+    esp_netif_dhcpc_stop(eth_netif);
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 1, 232);
+    IP4_ADDR(&ip_info.gw, 192, 168, 1, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+    esp_netif_set_ip_info(eth_netif, &ip_info);
+
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
+    xTaskCreate(tcp_server_task, "tcp_server", 4096, (void *)AF_INET, 5, NULL);
+}

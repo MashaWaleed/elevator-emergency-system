@@ -1,10 +1,80 @@
 import { Elevator } from '../types'
-import { motion } from 'framer-motion'
-import { Building2, Activity, Wifi, WifiOff, AlertTriangle, Zap, Signal, Server, Globe, Clock } from 'lucide-react'
+import { useState, useRef, useEffect } from 'react'
+import { Building2, Activity, Wifi, WifiOff, AlertTriangle, Zap, Signal, Server, Globe, Clock, DoorOpen } from 'lucide-react'
 
 export default function Monitoring({ elevators }: { elevators: Elevator[] }) {
+    // Force re-render every 5 seconds to update online/offline status
+    const [, setTick] = useState(0)
+    useEffect(() => {
+        const interval = setInterval(() => setTick(t => t + 1), 5000)
+        return () => clearInterval(interval)
+    }, [])
+
     const emergencies = elevators.filter(e => e.status === 'emergency').length
     const online = elevators.filter(e => e.lastSeen > 0 && Date.now() - e.lastSeen < 60000).length
+    
+    const [zoom, setZoom] = useState(1)
+    const [pan, setPan] = useState({ x: 0, y: 0 })
+    const canvasRef = useRef<HTMLDivElement>(null)
+    const [isDragging, setIsDragging] = useState(false)
+    const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
+
+    // Auto-fit all nodes on mount or when elevators change
+    useEffect(() => {
+        if (elevators.length > 0 && canvasRef.current) {
+            autoFitNodes()
+        }
+    }, [elevators.length])
+
+    const autoFitNodes = () => {
+        if (elevators.length === 0 || !canvasRef.current) return
+        
+        const bounds = {
+            minX: Math.min(...elevators.map(e => e.x)),
+            maxX: Math.max(...elevators.map(e => e.x + 160)),
+            minY: Math.min(...elevators.map(e => e.y)),
+            maxY: Math.max(...elevators.map(e => e.y + 140))
+        }
+        
+        const width = bounds.maxX - bounds.minX
+        const height = bounds.maxY - bounds.minY
+        const containerWidth = canvasRef.current.clientWidth
+        const containerHeight = canvasRef.current.clientHeight
+        
+        const zoomX = containerWidth / (width + 20)
+        const zoomY = containerHeight / (height + 20)
+        const newZoom = Math.min(zoomX, zoomY, 1.5)
+        
+        setZoom(newZoom)
+        setPan({
+            x: (containerWidth - width * newZoom) / 2 - bounds.minX * newZoom,
+            y: (containerHeight - height * newZoom) / 2 - bounds.minY * newZoom
+        })
+    }
+
+    const handleWheel = (e: React.WheelEvent) => {
+        e.preventDefault()
+        const delta = e.deltaY > 0 ? 0.9 : 1.1
+        setZoom(prev => Math.max(0.1, Math.min(3, prev * delta)))
+    }
+
+    const handleMouseDown = (e: React.MouseEvent) => {
+        setIsDragging(true)
+        setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y })
+    }
+
+    const handleMouseMove = (e: React.MouseEvent) => {
+        if (isDragging) {
+            setPan({
+                x: e.clientX - dragStart.x,
+                y: e.clientY - dragStart.y
+            })
+        }
+    }
+
+    const handleMouseUp = () => {
+        setIsDragging(false)
+    }
 
     return (
         <div className="flex flex-col gap-6 h-full">
@@ -54,184 +124,198 @@ export default function Monitoring({ elevators }: { elevators: Elevator[] }) {
                 </div>
             </header>
 
-            {/* Main Monitoring Grid */}
-            <div className="flex-1 glass p-6 overflow-hidden flex flex-col">
-                <div className="flex items-center justify-between mb-5">
+            {/* Spatial Canvas View */}
+            <div className="flex-1 glass overflow-hidden flex flex-col">
+                <div className="p-5 border-b flex items-center justify-between bg-black/20">
                     <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500/20 to-violet-500/20 flex items-center justify-center">
-                            <Activity size={16} className="text-blue-400" />
+                        <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center">
+                            <Activity size={14} className="text-tertiary" />
                         </div>
-                        <span className="font-semibold text-sm">Network Overview</span>
+                        <span className="font-semibold text-sm">Spatial Layout</span>
                     </div>
-                    <div className="flex items-center gap-4 text-xs text-tertiary">
-                        <LegendItem color="var(--success)" label="Normal" />
-                        <LegendItem color="var(--danger)" label="Emergency" />
-                        <LegendItem color="var(--text-muted)" label="Offline" />
+                    <div className="flex items-center gap-5 text-xs font-medium text-muted">
+                        <LegendDot color="var(--success)" label="Online" />
+                        <LegendDot color="var(--danger)" label="Emergency" />
+                        <LegendDot color="var(--text-muted)" label="Offline" />
                     </div>
                 </div>
 
-                <div className="flex-1 overflow-auto">
-                    {elevators.length > 0 ? (
-                        <div className="grid grid-cols-4 gap-5">
-                            {elevators.map((elevator, index) => (
-                                <motion.div
-                                    key={elevator.id}
-                                    initial={{ opacity: 0, y: 20 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ delay: index * 0.05, duration: 0.3 }}
-                                >
-                                    <ElevatorCard elevator={elevator} />
-                                </motion.div>
+                <div 
+                    ref={canvasRef}
+                    className="flex-1 relative canvas-grid overflow-hidden"
+                    onWheel={handleWheel}
+                    onMouseDown={handleMouseDown}
+                    onMouseMove={handleMouseMove}
+                    onMouseUp={handleMouseUp}
+                    onMouseLeave={handleMouseUp}
+                    style={{ cursor: isDragging ? 'grabbing' : 'grab', userSelect: 'none' }}
+                >
+                    {elevators.length === 0 ? (
+                        <EmptyState />
+                    ) : (
+                        <div
+                            style={{
+                                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                                transformOrigin: '0 0',
+                                width: '100%',
+                                height: '100%',
+                                position: 'relative'
+                            }}
+                        >
+                            {/* SVG Layer for Lines */}
+                            <svg
+                                style={{
+                                    position: 'absolute',
+                                    left: 0,
+                                    top: 0,
+                                    width: '100%',
+                                    height: '100%',
+                                    pointerEvents: 'none',
+                                    zIndex: 0,
+                                    overflow: 'visible'
+                                }}
+                            >
+                                {elevators.map((node) => 
+                                    node.elevators?.map((elevator) => (
+                                        <line
+                                            key={`line-${elevator.id}`}
+                                            x1={node.x + 80}
+                                            y1={node.y + 80}
+                                            x2={elevator.x + 64}
+                                            y2={elevator.y + 48}
+                                            stroke="rgba(59, 130, 246, 0.4)"
+                                            strokeWidth="2"
+                                        />
+                                    ))
+                                )}
+                            </svg>
+                            
+                            {elevators.map((node) => (
+                                <div key={node.id}>
+                                    {/* Node */}
+                                    <div
+                                        className="absolute"
+                                        style={{ left: node.x, top: node.y }}
+                                    >
+                                        <NodeDisplay node={node} />
+                                    </div>
+                                    
+                                    {/* Elevators linked to this node */}
+                                    {node.elevators?.map((elevator) => (
+                                        <div
+                                            key={elevator.id}
+                                            className="absolute"
+                                            style={{ left: elevator.x, top: elevator.y }}
+                                        >
+                                            <ElevatorDisplay elevator={elevator} />
+                                        </div>
+                                    ))}
+                                </div>
                             ))}
                         </div>
-                    ) : (
-                        <EmptyState />
                     )}
+                </div>
+
+                <div className="p-4 bg-black/30 border-t flex justify-between text-xs font-mono text-muted">
+                    <span>LIVE MONITORING</span>
+                    <span>ZOOM: {(zoom * 100).toFixed(0)}%</span>
+                    <span>SCROLL TO ZOOM • DRAG TO PAN</span>
                 </div>
             </div>
         </div>
     )
 }
 
-function ElevatorCard({ elevator }: { elevator: Elevator }) {
-    const isEmergency = elevator.status === 'emergency'
-    const isOnline = elevator.lastSeen > 0 && Date.now() - elevator.lastSeen < 60000
+function NodeDisplay({ node }: { node: Elevator }) {
+    const isEmergency = node.status === 'emergency'
+    const isOnline = node.lastSeen > 0 && Date.now() - node.lastSeen < 60000
     const isOffline = !isOnline
     const statusColor = isEmergency ? 'var(--danger)' : isOffline ? 'var(--text-muted)' : 'var(--success)'
 
-    const getTimeSinceLastSeen = () => {
-        if (!elevator.lastSeen) return 'Never'
-        const seconds = Math.floor((Date.now() - elevator.lastSeen) / 1000)
-        if (seconds < 60) return `${seconds}s ago`
-        const minutes = Math.floor(seconds / 60)
-        if (minutes < 60) return `${minutes}m ago`
-        const hours = Math.floor(minutes / 60)
-        return `${hours}h ago`
-    }
-
     return (
-        <div className={`elevator-card group ${isEmergency ? 'emergency' : ''}`}>
-            {/* Top Row - Icon & Status */}
-            <div className="flex justify-between items-start mb-4">
+        <div className={`w-40 glass-card relative p-4 flex flex-col items-center text-center group ${isEmergency ? 'border-danger/40' : 'border-white/10'}`} style={{userSelect: 'none'}}>
+            {/* Live Status Indicator - Top Left */}
+            <div className="absolute top-3 left-3 flex items-center gap-1.5">
                 <div
-                    className="w-12 h-12 rounded-xl flex items-center justify-center transition-all"
+                    className="w-2 h-2 rounded-full"
                     style={{
-                        background: isEmergency
-                            ? 'rgba(239, 68, 68, 0.15)'
-                            : 'rgba(255, 255, 255, 0.05)',
-                        border: `1px solid ${isEmergency ? 'rgba(239, 68, 68, 0.3)' : 'rgba(255, 255, 255, 0.08)'}`
+                        background: isOnline ? 'var(--success)' : 'var(--danger)',
+                        boxShadow: isOnline ? '0 0 6px rgba(16, 185, 129, 0.6)' : '0 0 6px rgba(239, 68, 68, 0.4)'
                     }}
-                >
-                    <Building2
-                        size={22}
-                        className={isEmergency ? 'text-danger' : isOffline ? 'text-muted' : 'text-blue-400'}
-                    />
-                </div>
-                <div className="flex flex-col items-end gap-2">
-                    <StatusBadge status={isEmergency ? 'emergency' : isOffline ? 'offline' : 'normal'} />
-                </div>
-            </div>
-
-            {/* Elevator Info */}
-            <div className="mb-4">
-                <h3 className="text-lg font-bold tracking-tight mb-1 group-hover:text-blue-400 transition-colors">
-                    {elevator.id}
-                </h3>
-                <div className="flex items-center gap-2 text-xs text-tertiary mb-1">
-                    <Globe size={12} />
-                    <span className="font-mono">{elevator.ip_address}</span>
-                </div>
-                <p className="text-xs text-muted uppercase tracking-wider font-medium">
-                    {elevator.building} • Floor {elevator.floor}
-                </p>
-            </div>
-
-            {/* Connection Status */}
-            <div className="mb-4 p-3 rounded-lg bg-black/20 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                    {isOffline ? (
-                        <WifiOff size={14} className="text-muted" />
-                    ) : (
-                        <Wifi size={14} className="text-success" />
-                    )}
-                    <span className="text-xs font-mono">
-                        {isOffline ? 'DISCONNECTED' : 'CONNECTED'}
-                    </span>
-                </div>
-                <div className="flex items-center gap-1 text-xs text-muted">
-                    <Clock size={10} />
-                    <span className="font-mono">{getTimeSinceLastSeen()}</span>
-                </div>
-            </div>
-
-            {/* Bottom Stats */}
-            <div className="pt-3 border-t border-white/5 flex justify-between items-center">
-                <div>
-                    <p className="text-xs text-muted uppercase tracking-wide mb-0.5 font-semibold">Status</p>
-                    <div className="flex items-center gap-2">
-                        <div
-                            className="w-2 h-2 rounded-full"
-                            style={{
-                                background: statusColor,
-                                boxShadow: isEmergency ? '0 0 8px var(--danger-glow)' : undefined
-                            }}
-                        />
-                        <p className="text-sm font-mono font-medium">
-                            {isEmergency ? 'ALERT' : isOffline ? 'OFFLINE' : 'NORMAL'}
-                        </p>
-                    </div>
-                </div>
-                <div className="text-right">
-                    <p className="text-xs text-muted uppercase tracking-wide mb-0.5 font-semibold">Last Ping</p>
-                    <p className="text-sm font-mono">
-                        {elevator.lastSeen
-                            ? new Date(elevator.lastSeen).toLocaleTimeString([], { hour12: false })
-                            : '--:--:--'
-                        }
-                    </p>
-                </div>
-            </div>
-
-            {/* Glow Effect for Emergency */}
-            {isEmergency && (
-                <motion.div
-                    className="absolute inset-0 rounded-xl pointer-events-none"
-                    animate={{
-                        boxShadow: [
-                            '0 0 20px rgba(239, 68, 68, 0.2)',
-                            '0 0 40px rgba(239, 68, 68, 0.4)',
-                            '0 0 20px rgba(239, 68, 68, 0.2)'
-                        ]
-                    }}
-                    transition={{ duration: 1.5, repeat: Infinity }}
                 />
+                <span
+                    className="text-xs font-mono"
+                    style={{ color: isOnline ? 'var(--success)' : 'var(--danger)' }}
+                >
+                    {isOnline ? 'LIVE' : 'OFF'}
+                </span>
+            </div>
+            
+            {/* Emergency Status Indicator - Top Right */}
+            <div
+                className="absolute top-3 right-3 w-2.5 h-2.5 rounded-full"
+                style={{
+                    background: statusColor,
+                    boxShadow: isEmergency ? '0 0 8px rgba(239, 68, 68, 0.5)' : 'none',
+                    display: isEmergency ? 'block' : 'none'
+                }}
+            />
+
+            <div className="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center mb-3">
+                <Server size={18} className="text-muted" />
+            </div>
+
+            <span className="text-xs font-bold uppercase tracking-tight mb-1">
+                {node.id}
+            </span>
+            <span className="text-xs text-tertiary font-mono mb-1">
+                {node.ip_address}
+            </span>
+            <span className="text-xs text-muted font-medium uppercase tracking-wider">
+                {node.building}
+            </span>
+
+            <div className="mt-2 px-2.5 py-1 rounded-md bg-black/30 text-xs font-mono text-tertiary">
+                FL {node.floor}
+            </div>
+            
+            {isEmergency && (
+                <div className="mt-2 text-xs font-bold text-danger uppercase tracking-wide">
+                    EMERGENCY
+                </div>
             )}
         </div>
     )
 }
 
-function StatusBadge({ status }: { status: 'normal' | 'emergency' | 'offline' }) {
-    const configs = {
-        normal: {
-            className: 'status-normal',
-            label: 'Normal'
-        },
-        emergency: {
-            className: 'status-emergency',
-            label: 'Emergency'
-        },
-        offline: {
-            className: 'status-offline',
-            label: 'Offline'
-        }
-    }
-    const config = configs[status]
+function ElevatorDisplay({ elevator }: { elevator: any }) {
+    const isEmergency = elevator.status === 'emergency'
+    const statusColor = isEmergency ? 'var(--danger)' : 'var(--success)'
 
     return (
-        <span className={`status-indicator ${config.className}`}>
-            {status === 'emergency' && <Zap size={10} />}
-            {config.label}
-        </span>
+        <div className={`w-32 glass-card p-3 flex flex-col items-center text-center ${isEmergency ? 'border-danger/40' : 'border-white/10'}`} style={{userSelect: 'none'}}>
+            <div
+                className="absolute top-2 right-2 w-2 h-2 rounded-full"
+                style={{
+                    background: statusColor,
+                    boxShadow: isEmergency ? '0 0 6px rgba(239, 68, 68, 0.5)' : 'none'
+                }}
+            />
+
+            <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center mb-2">
+                <DoorOpen size={16} className={isEmergency ? "text-danger" : "text-muted"} />
+            </div>
+
+            <span className="text-xs font-bold uppercase tracking-tight">
+                {elevator.label}
+            </span>
+            
+            {isEmergency && (
+                <div className="mt-1 text-xs font-bold text-danger uppercase">
+                    ALERT
+                </div>
+            )}
+        </div>
     )
 }
 
@@ -258,16 +342,8 @@ function StatCard({
     }
 
     return (
-        <motion.div
+        <div
             className="stat-card flex items-center gap-4 min-w-[180px]"
-            animate={highlight ? {
-                boxShadow: [
-                    '0 0 15px rgba(239, 68, 68, 0.2)',
-                    '0 0 25px rgba(239, 68, 68, 0.4)',
-                    '0 0 15px rgba(239, 68, 68, 0.2)'
-                ]
-            } : {}}
-            transition={highlight ? { duration: 2, repeat: Infinity } : {}}
             style={highlight ? { borderColor: 'rgba(239, 68, 68, 0.3)' } : {}}
         >
             <div
@@ -291,11 +367,11 @@ function StatCard({
                     {suffix && <span className="text-sm text-tertiary font-mono">{suffix}</span>}
                 </div>
             </div>
-        </motion.div>
+        </div>
     )
 }
 
-function LegendItem({ color, label }: { color: string; label: string }) {
+function LegendDot({ color, label }: { color: string; label: string }) {
     return (
         <div className="flex items-center gap-2">
             <div
@@ -310,14 +386,9 @@ function LegendItem({ color, label }: { color: string; label: string }) {
 function EmptyState() {
     return (
         <div className="h-full flex flex-col items-center justify-center">
-            <motion.div
-                animate={{ y: [0, -8, 0] }}
-                transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
-            >
-                <div className="w-24 h-24 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center mb-6">
-                    <Building2 size={48} className="text-muted opacity-30" />
-                </div>
-            </motion.div>
+            <div className="w-24 h-24 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center mb-6">
+                <Building2 size={48} className="text-muted opacity-30" />
+            </div>
             <h3 className="text-lg font-semibold text-secondary mb-2">No Monitoring Nodes</h3>
             <p className="text-sm text-muted max-w-xs text-center">
                 Configure elevator nodes in the Build panel to start monitoring your network.

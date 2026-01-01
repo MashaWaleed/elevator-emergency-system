@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
-import { LayoutDashboard, ShieldAlert, Settings, History, Radio } from 'lucide-react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { LayoutDashboard, ShieldAlert, Settings, History } from 'lucide-react'
 import Monitoring from './components/Monitoring'
 import DashboardBuilder from './components/DashboardBuilder'
 import HistoryView from './components/History'
@@ -10,7 +9,7 @@ import { Elevator, EmergencyEvent } from './types'
 export default function App() {
     const [activeTab, setActiveTab] = useState<'monitoring' | 'builder' | 'history'>('monitoring')
     const [elevators, setElevators] = useState<Elevator[]>([])
-    const [activeEmergency, setActiveEmergency] = useState<EmergencyEvent | null>(null)
+    const [activeEmergencies, setActiveEmergencies] = useState<EmergencyEvent[]>([])
     const [isAlarmPlaying, setIsAlarmPlaying] = useState(false)
     const [currentTime, setCurrentTime] = useState(new Date())
 
@@ -32,11 +31,35 @@ export default function App() {
         const unsubscribe = window.electron.on('elevator-event', (data: EmergencyEvent) => {
             console.log('Received elevator event:', data)
 
+            // Get both node_id and elevator_id for proper tracking
+            const nodeId = data.node_id || data.elevator_id
+            const elevatorId = data.elevator_id || data.node_id
+
+            if (data.type === 'heartbeat') {
+                // For heartbeats, just update lastSeen without triggering emergency
+                setElevators(prev => prev.map(el => {
+                    if (el.id === nodeId) {
+                        return { ...el, lastSeen: Date.now() }
+                    }
+                    return el
+                }))
+                return
+            }
+
             if (data.status === 'active') {
-                setActiveEmergency(data)
+                // Add to emergencies list if not already there - track by elevator_id to allow stacking
+                setActiveEmergencies(prev => {
+                    const exists = prev.some(e => e.elevator_id === elevatorId)
+                    if (!exists) {
+                        return [...prev, { ...data, node_id: nodeId, elevator_id: elevatorId }]
+                    }
+                    return prev
+                })
                 setIsAlarmPlaying(true)
                 playAlertSound()
             } else if (data.status === 'acknowledged') {
+                // Remove from emergencies list by elevator_id
+                setActiveEmergencies(prev => prev.filter(e => e.elevator_id !== elevatorId))
                 // Refresh elevators list to get updated status
                 loadElevators()
             }
@@ -59,9 +82,11 @@ export default function App() {
     }, [])
 
     const updateElevatorStatus = (data: EmergencyEvent) => {
+        const nodeId = data.node_id || data.elevator_id
+        
         setElevators(prev => {
             // Check if elevator exists
-            const exists = prev.some(el => el.id === data.elevator_id)
+            const exists = prev.some(el => el.id === nodeId)
 
             if (!exists) {
                 // New elevator auto-registered via UDP - reload from DB
@@ -70,7 +95,7 @@ export default function App() {
             }
 
             return prev.map(el => {
-                if (el.id === data.elevator_id) {
+                if (el.id === nodeId) {
                     return {
                         ...el,
                         status: data.status === 'active' ? 'emergency' : 'normal',
@@ -94,16 +119,23 @@ export default function App() {
         window.alertAudio = audio
     }
 
-    const acknowledgeEmergency = async () => {
-        if (activeEmergency) {
+    const acknowledgeEmergency = async (elevatorId: string) => {
+        const emergency = activeEmergencies.find(e => e.elevator_id === elevatorId)
+        if (emergency) {
             try {
-                await window.electron.invoke('acknowledge-emergency', activeEmergency)
-                if (window.alertAudio) {
-                    window.alertAudio.pause()
-                    window.alertAudio = null
+                await window.electron.invoke('acknowledge-emergency', emergency)
+                
+                // Remove from active emergencies
+                setActiveEmergencies(prev => prev.filter(e => e.elevator_id !== elevatorId))
+                
+                // Stop alarm if no more emergencies
+                if (activeEmergencies.length <= 1) {
+                    if (window.alertAudio) {
+                        window.alertAudio.pause()
+                        window.alertAudio = null
+                    }
+                    setIsAlarmPlaying(false)
                 }
-                setActiveEmergency(null)
-                setIsAlarmPlaying(false)
 
                 // Refresh elevator list
                 loadElevators()
@@ -126,14 +158,10 @@ export default function App() {
 
     return (
         <div className="flex h-full overflow-hidden">
-            {/* Premium Sidebar Navigation */}
+            {/* Sidebar Navigation */}
             <aside className="sidebar flex flex-col items-center py-6 gap-3">
                 {/* Logo */}
-                <motion.div
-                    className="flex items-center justify-center mb-6"
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                >
+                <div className="flex items-center justify-center mb-6">
                     <div className="relative">
                         <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500/20 to-violet-500/20 border border-blue-500/30 flex items-center justify-center">
                             <ShieldAlert size={24} className="text-blue-400" />
@@ -142,14 +170,11 @@ export default function App() {
                             className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2"
                             style={{
                                 background: isAlarmPlaying ? 'var(--danger)' : 'var(--success)',
-                                borderColor: 'var(--bg-primary)',
-                                boxShadow: isAlarmPlaying
-                                    ? '0 0 8px rgba(239, 68, 68, 0.6)'
-                                    : '0 0 8px rgba(16, 185, 129, 0.6)'
+                                borderColor: 'var(--bg-primary)'
                             }}
                         />
                     </div>
-                </motion.div>
+                </div>
 
                 {/* Navigation Items */}
                 <nav className="flex flex-col items-center gap-2">
@@ -192,51 +217,18 @@ export default function App() {
 
             {/* Main Content Area */}
             <main className="flex-1 overflow-hidden relative p-6">
-                <AnimatePresence mode="wait">
-                    {activeTab === 'monitoring' && (
-                        <motion.div
-                            key="monitoring"
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -10 }}
-                            transition={{ duration: 0.2, ease: 'easeOut' }}
-                            className="h-full"
-                        >
-                            <Monitoring elevators={elevators} />
-                        </motion.div>
-                    )}
-                    {activeTab === 'builder' && (
-                        <motion.div
-                            key="builder"
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -10 }}
-                            transition={{ duration: 0.2, ease: 'easeOut' }}
-                            className="h-full"
-                        >
-                            <DashboardBuilder
-                                elevators={elevators}
-                                onElevatorsChange={handleElevatorsChange}
-                            />
-                        </motion.div>
-                    )}
-                    {activeTab === 'history' && (
-                        <motion.div
-                            key="history"
-                            initial={{ opacity: 0, y: 10 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -10 }}
-                            transition={{ duration: 0.2, ease: 'easeOut' }}
-                            className="h-full"
-                        >
-                            <HistoryView />
-                        </motion.div>
-                    )}
-                </AnimatePresence>
+                {activeTab === 'monitoring' && <Monitoring elevators={elevators} />}
+                {activeTab === 'builder' && (
+                    <DashboardBuilder
+                        elevators={elevators}
+                        onElevatorsChange={handleElevatorsChange}
+                    />
+                )}
+                {activeTab === 'history' && <HistoryView />}
             </main>
 
             <AlertModal
-                emergency={activeEmergency}
+                emergencies={activeEmergencies}
                 onAcknowledge={acknowledgeEmergency}
             />
         </div>
@@ -250,15 +242,13 @@ function NavButton({ active, onClick, icon, label }: {
     label: string
 }) {
     return (
-        <motion.button
+        <button
             onClick={onClick}
             className={`nav-item ${active ? 'active' : ''}`}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
         >
             {icon}
             <span className="text-xs font-bold tracking-wider">{label}</span>
-        </motion.button>
+        </button>
     )
 }
 
